@@ -3,9 +3,9 @@
 from swingtrader.config import TradingConfig
 
 # Validated as the paper endpoint; the SDK connects there with paper=True.
-APCA_API_BASE_URL = "https://paper-api.alpaca.markets"
-APCA_API_KEY_ID = ""
-APCA_API_SECRET_KEY = ""
+APCA_API_BASE_URL = "https://paper-api.alpaca.markets/v2"
+APCA_API_KEY_ID = "PKMUG4SDLORJF4QYT4OKHU4T62"
+APCA_API_SECRET_KEY = "2xyvwBBUua9CEDnfB1QEKpby8kQD6ujHhv1oqD6GaZj7"
 
 TRADING_CONFIG = TradingConfig(
 	account_size=1000.0,                   # Dollars used for sizing (not Alpaca account equity).
