@@ -1,11 +1,14 @@
 import json
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 import pandas as pd
 import yfinance as yf
+
+
+SMA_WARMUP_SESSIONS = 199
 
 
 def fetch_market_candidates(
@@ -83,7 +86,47 @@ def _cache_file(cache_dir: Path, symbol: str, period: str) -> Path:
     return cache_dir / f"{quote(symbol, safe='')}__{quote(period, safe='')}.pkl"
 
 
-def _download_chunks(symbols: list[str], period: str, batch_size: int) -> dict[str, pd.DataFrame]:
+def load_cached_daily_close(
+    symbol: str,
+    cache_dir: str | Path = "data/cache/ohlcv",
+    *,
+    include_sma_warmup: bool = False,
+) -> pd.Series | None:
+    """Load cached adjusted daily closes, optionally including SMA warm-up bars."""
+    path = _cache_file(Path(cache_dir), symbol, "1y")
+    if not path.is_file():
+        return None
+
+    try:
+        history = pd.read_pickle(path)
+    except (OSError, ValueError, TypeError, EOFError) as exc:
+        raise ValueError(f"Unable to read cached daily history for {symbol}: {exc}") from exc
+
+    if "Close" not in history:
+        raise ValueError(f"Cached daily history for {symbol} has no Close column")
+
+    close = history["Close"].dropna().sort_index()
+    if close.empty:
+        return close
+
+    cutoff = close.index[-1] - pd.Timedelta(days=365)
+    if include_sma_warmup:
+        visible_start = close.index.searchsorted(cutoff)
+        warmup_start = max(0, visible_start - SMA_WARMUP_SESSIONS)
+        return close.iloc[warmup_start:]
+    return close.loc[close.index >= cutoff]
+
+
+def _download_chunks(
+    symbols: list[str],
+    period: str | None,
+    batch_size: int,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    minimum_rows: int = 30,
+    checked: set[str] | None = None,
+) -> dict[str, pd.DataFrame]:
     import time
 
     results = {}
@@ -91,15 +134,18 @@ def _download_chunks(symbols: list[str], period: str, batch_size: int) -> dict[s
     for idx in range(total_batches):
         chunk = symbols[idx * batch_size : (idx + 1) * batch_size]
         try:
+            date_range = {"start": start, "end": end} if start is not None else {"period": period}
             df = yf.download(
                 chunk,
-                period=period,
                 interval="1d",
                 auto_adjust=True,
                 group_by="ticker",
                 progress=False,
                 threads=True,
+                **date_range,
             )
+            if checked is not None:
+                checked.update(chunk)
             if df.empty:
                 continue
 
@@ -108,14 +154,14 @@ def _download_chunks(symbols: list[str], period: str, batch_size: int) -> dict[s
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
                 clean_df = df.dropna()
-                if not clean_df.empty and len(clean_df) >= 30:
+                if not clean_df.empty and len(clean_df) >= minimum_rows:
                     results[ticker] = clean_df
             else:
                 for ticker in chunk:
                     try:
                         if ticker in df:
                             sub_df = df[ticker].dropna()
-                            if not sub_df.empty and len(sub_df) >= 30:
+                            if not sub_df.empty and len(sub_df) >= minimum_rows:
                                 results[ticker] = sub_df
                     except Exception:
                         continue
@@ -133,9 +179,16 @@ def _merge_history(cached: pd.DataFrame, update: pd.DataFrame, period: str) -> p
     merged = pd.concat([cached, update])
     merged = merged[~merged.index.duplicated(keep="last")].sort_index().dropna()
     if period == "1y" and not merged.empty:
-        cutoff = merged.index[-1] - pd.DateOffset(years=1)
+        cutoff = merged.index[-1] - pd.DateOffset(years=2)
         merged = merged.loc[merged.index >= cutoff]
     return merged
+
+
+def _has_sma_warmup(history: pd.DataFrame) -> bool:
+    if history.empty:
+        return False
+    cutoff = history.index.max() - pd.DateOffset(years=1)
+    return int((history.index < cutoff).sum()) >= SMA_WARMUP_SESSIONS
 
 
 def download_batch(
@@ -153,7 +206,9 @@ def download_batch(
     today = date.today()
     results = {}
     missing = []
-    stale = []
+    backfill = []
+    stale = {}
+    checked = set()
 
     for symbol in symbols:
         path = _cache_file(cache_root, symbol, period)
@@ -166,13 +221,44 @@ def download_batch(
                 missing.append(symbol)
                 continue
             results[symbol] = cached
+            if period == "1y" and not _has_sma_warmup(cached):
+                backfill.append(symbol)
+                continue
             if datetime.fromtimestamp(path.stat().st_mtime).date() != today:
-                stale.append(symbol)
+                stale.setdefault(pd.Timestamp(cached.index.max()).date(), []).append(symbol)
         except (OSError, ValueError, TypeError, EOFError):
             missing.append(symbol)
 
-    downloaded = _download_chunks(missing, period, batch_size)
-    updates = _download_chunks(stale, "5d", batch_size)
+    download_period = "2y" if period == "1y" else period
+    downloaded = _download_chunks(missing, download_period, batch_size)
+    updates = {}
+    end_date = (today + timedelta(days=1)).isoformat()
+    window_start = (pd.Timestamp(today) - pd.DateOffset(years=2)).date()
+    if backfill:
+        updates.update(
+            _download_chunks(
+                backfill,
+                None,
+                batch_size,
+                start=window_start.isoformat(),
+                end=end_date,
+                minimum_rows=1,
+                checked=checked,
+            )
+        )
+    for latest_date, stale_symbols in stale.items():
+        start_date = max(latest_date + timedelta(days=1), window_start).isoformat()
+        updates.update(
+            _download_chunks(
+                stale_symbols,
+                None,
+                batch_size,
+                start=start_date,
+                end=end_date,
+                minimum_rows=1,
+                checked=checked,
+            )
+        )
 
     for symbol, history in downloaded.items():
         results[symbol] = history
@@ -186,12 +272,39 @@ def download_batch(
         except OSError:
             pass
 
-    fresh_count = len(symbols) - len(missing) - len(stale)
+    for stale_symbols in stale.values():
+        for symbol in stale_symbols:
+            if symbol in checked and symbol not in updates:
+                try:
+                    _cache_file(cache_root, symbol, period).touch()
+                except OSError:
+                    pass
+
+    stale_symbols = {symbol for group in stale.values() for symbol in group}
+    fresh_count = len(symbols) - len(missing) - len(stale_symbols) - len(backfill)
     unavailable_count = len(symbols) - len(results)
     print(
-        f"OHLCV cache: {fresh_count} fresh, {len(updates)} refreshed, "
+        f"OHLCV cache: {fresh_count} fresh, {len(updates)} updated, "
         f"{len(downloaded)} full downloads, {unavailable_count} unavailable."
     )
+    if period == "1y":
+        incomplete_sma = [
+            symbol
+            for symbol in symbols
+            if symbol in results and not _has_sma_warmup(results[symbol])
+        ]
+        if incomplete_sma:
+            print(
+                "Warning: 200-day SMA warm-up is still incomplete for "
+                f"{', '.join(incomplete_sma)}."
+            )
+        return {
+            symbol: history.loc[
+                history.index >= history.index[-1] - pd.DateOffset(years=1)
+            ]
+            for symbol, history in results.items()
+            if not history.empty
+        }
     return results
 
 

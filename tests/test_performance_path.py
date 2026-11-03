@@ -1,6 +1,8 @@
 import io
+import os
 import unittest
 from contextlib import redirect_stdout
+from datetime import date, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -67,7 +69,7 @@ class ScannerPerformancePathTests(unittest.TestCase):
         mock_run_scanner.side_effect = lambda **kwargs: print("\n## Candidates\n\n| Symbol |\n|---|\n| TEST |")
 
         with TemporaryDirectory() as report_dir, patch("main.REPORT_DIR", Path(report_dir)):
-            with patch("main.sys.argv", ["main.py"]), redirect_stdout(io.StringIO()) as output:
+            with patch("main.sys.argv", ["main.py", "--cli"]), redirect_stdout(io.StringIO()) as output:
                 main.main()
                 main.main()
 
@@ -106,18 +108,20 @@ class ScannerPerformancePathTests(unittest.TestCase):
             download_batch(["TEST"], cache_dir=cache_dir)
 
         self.assertTrue(mock_download.call_args.kwargs["threads"])
+        self.assertEqual(mock_download.call_args.kwargs["period"], "2y")
 
     @patch("swingtrader.data.yf.download")
     def test_warm_history_cache_skips_download(self, mock_download):
+        dates = pd.bdate_range(end=date.today(), periods=500)
         history = pd.DataFrame(
             {
-                "Open": range(30),
-                "High": range(1, 31),
-                "Low": range(30),
-                "Close": range(1, 31),
-                "Volume": [1_000_000] * 30,
+                "Open": range(500),
+                "High": range(1, 501),
+                "Low": range(500),
+                "Close": range(1, 501),
+                "Volume": [1_000_000] * 500,
             },
-            index=pd.date_range("2026-08-01", periods=30),
+            index=dates,
         )
         mock_download.return_value = history
 
@@ -127,6 +131,86 @@ class ScannerPerformancePathTests(unittest.TestCase):
 
         self.assertEqual(mock_download.call_count, 1)
         pd.testing.assert_frame_equal(first["TEST"], second["TEST"])
+
+    @patch("swingtrader.data.yf.download")
+    def test_stale_history_fetches_from_day_after_last_cached_bar(self, mock_download):
+        today = date.today()
+        cached_end = today - timedelta(days=8)
+        dates = pd.bdate_range(end=cached_end, periods=500)
+        history = pd.DataFrame(
+            {
+                "Open": range(500),
+                "High": range(1, 501),
+                "Low": range(500),
+                "Close": range(1, 501),
+                "Volume": [1_000_000] * 500,
+            },
+            index=dates,
+        )
+        update_dates = pd.date_range(cached_end + timedelta(days=1), periods=2)
+        update = pd.DataFrame(
+            {
+                "Open": [31, 32],
+                "High": [32, 33],
+                "Low": [31, 32],
+                "Close": [32, 33],
+                "Volume": [1_000_000] * 2,
+            },
+            index=update_dates,
+        )
+        mock_download.return_value = update
+
+        with TemporaryDirectory() as cache_dir:
+            cache_path = Path(cache_dir) / "TEST__1y.pkl"
+            history.to_pickle(cache_path)
+            os.utime(cache_path, (0, 0))
+
+            result = download_batch(["TEST"], cache_dir=cache_dir)
+            cached_history = pd.read_pickle(cache_path)
+
+        self.assertEqual(
+            mock_download.call_args.kwargs["start"],
+            (dates[-1].date() + timedelta(days=1)).isoformat(),
+        )
+        self.assertEqual(mock_download.call_args.kwargs["end"], (today + timedelta(days=1)).isoformat())
+        self.assertNotIn("period", mock_download.call_args.kwargs)
+        self.assertGreater(len(result["TEST"]), 200)
+        self.assertEqual(result["TEST"].index.max(), update_dates[-1])
+        self.assertEqual(len(cached_history), 502)
+
+    @patch("swingtrader.data.yf.download")
+    def test_short_one_year_cache_is_backfilled_for_sma_warmup(self, mock_download):
+        today = date.today()
+        cached_dates = pd.bdate_range(end=today, periods=260)
+        cached = pd.DataFrame({"Close": range(260)}, index=cached_dates)
+        updated_dates = pd.bdate_range(
+            start=pd.Timestamp(today) - pd.DateOffset(years=2),
+            end=today,
+        )
+        update = pd.DataFrame({"Close": range(len(updated_dates))}, index=updated_dates)
+        mock_download.return_value = update
+
+        with TemporaryDirectory() as cache_dir:
+            cache_path = Path(cache_dir) / "TEST__1y.pkl"
+            cached.to_pickle(cache_path)
+            result = download_batch(["TEST"], cache_dir=cache_dir)
+            cached_history = pd.read_pickle(cache_path)
+
+        self.assertEqual(
+            mock_download.call_args.kwargs["start"],
+            (pd.Timestamp(today) - pd.DateOffset(years=2)).date().isoformat(),
+        )
+        self.assertNotIn("period", mock_download.call_args.kwargs)
+        self.assertGreaterEqual(
+            int(
+                (
+                    cached_history.index
+                    < cached_history.index.max() - pd.DateOffset(years=1)
+                ).sum()
+            ),
+            199,
+        )
+        self.assertLess(len(result["TEST"]), len(cached_history))
 
     @patch("swingtrader.data.yf.download")
     def test_latest_prices_include_extended_hours(self, mock_download):

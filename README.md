@@ -28,7 +28,8 @@ account credentials. The example also lists the scanner, sizing, sentiment, and
 paper quote limits in `TRADING_CONFIG`; edit them in your local copy to change
 the defaults. `--min-price` and `--max-price` override the local price settings
 for a run. The local `config.py` is ignored by Git; do not commit or paste your
-keys. A regular `python main.py` scan does not need credentials or a config file.
+keys. Running `python main.py` without arguments opens the GUI. Add `--cli` to
+run a command-line scan, which does not need credentials or a config file.
 
 ## Alpaca Paper Workflow
 
@@ -99,17 +100,35 @@ leave a 180-day position unattended without checking and renewing its exits.
 
 ## Run scanner
 
-To scan the entire NYSE and NASDAQ universe ($5–$30, >500k volume) and return the Top 25 candidates:
+Launch the Kivy interface and run scans from its **Run Scan** button:
 
 ```powershell
 python main.py
 ```
 
+The ranked candidates populate the matching table fields when the scan finishes.
+The interface supports the scanner options `--symbols`, `--top`, `--min-price`,
+`--max-price`, and `--output`.
+Completed GUI scans are saved as timestamped JSON files under
+`data/scans/gui_runs`; the app restores the most recent saved results on launch.
+Selecting a ranked symbol opens its info window with a one-year daily closing-price
+graph from the local OHLCV cache in the upper-right quarter, with quarter-dollar
+price ticks on the right, three-letter month labels along the bottom, and a white
+200-day simple moving average across the full displayed year. Use the up and down
+arrow keys in the info window to view the previous or next ranked symbol;
+navigation stops at the first and last results.
+
+To scan the entire NYSE and NASDAQ universe ($5–$30, >500k volume) and return the Top 25 candidates:
+
+```powershell
+python main.py --cli
+```
+
 To scan specific tickers or adjust parameters:
 
 ```powershell
-python main.py --symbols SOFI PLTR AGRO ABUS AES
-python main.py --top 10 --min-price 5 --max-price 30
+python main.py --cli --symbols SOFI PLTR AGRO ABUS AES
+python main.py --cli --top 10 --min-price 5 --max-price 30
 ```
 
 Each run prints a Markdown candidate table, saves a structured snapshot under
@@ -119,9 +138,14 @@ Markdown preview to see the rendered table. Reports include scan progress, candi
 (or the no-candidates message), and total runtime. Repeated runs never overwrite an
 earlier report.
 
-Daily OHLCV histories are cached under `data/cache/ohlcv`. Repeated scans on the
-same day reuse the cache; later scans fetch recent bars and merge them into the
-stored one-year history. The CLI prints total application runtime when it finishes.
+Daily OHLCV histories are cached under `data/cache/ohlcv`. The one-year scan cache
+retains up to two years of daily bars so the chart can calculate 199 warm-up
+sessions before the displayed year; scanner analysis still uses only the latest
+year. Initial downloads fetch two years, and older one-year caches are backfilled
+when they lack enough SMA history. Repeated scans on the same day reuse the cache;
+later scans fetch from the day after each symbol's latest cached bar through the
+current date and merge available trading-day bars. The CLI prints total application
+runtime when it finishes.
 Technical signals remain based on completed daily candles. After qualification,
 candidate entries, stops, targets, and share counts are refreshed in batches using
 the latest available one-minute trade, including pre-market and after-hours bars.
