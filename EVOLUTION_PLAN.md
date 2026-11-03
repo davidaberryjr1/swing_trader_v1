@@ -1302,9 +1302,65 @@ Only after successful paper validation:
 - Backtests now record strategy ID/version and a SHA-256 hash plus exact JSON snapshot of `TradingConfig`; increment the strategy version manually when rules change.
 - Standard reports now include annualized return/risk ratios, benchmark return difference, trade win/loss distributions, expectancy, loss streak, holding sessions, gross exposure, turnover, descriptive SPY regime performance, sector exposure, open-position correlation, and signal-time relative strength versus SPY/sector ETF.
 - Backtest runs, normalized trade ledgers, daily equity points, regime summaries, sector aggregates, correlation summaries, and relative-strength observations now persist in a dedicated SQLite database; sensitivity report rows carry their run IDs.
+- Scanner and backtester now share a market-data provider contract with yfinance and Alpaca adapters; the scanner remains on its existing yfinance cache and the backtester remains on Alpaca.
 - Limitations remain: survivorship-biased explicit symbol basket, no historical sentiment, daily-bar fill ambiguity, manual non-point-in-time sector assignments, and no sector/correlation-aware capital allocation.
 - The experiment runner is deferred; strategy/config identity remains recorded to preserve reproducibility.
-- Next: unify scanner and backtest market-data provider boundaries while preserving the current signal behavior.
+---
+
+## Progress Update (2026-10-18)
+
+- Added pre-backtest daily-bar contract checks for required OHLCV fields, invalid/inconsistent values, duplicate or unordered sessions, and dates outside the requested range.
+- Integrated the `pandas-market-calendars` NYSE calendar so missing-bar diagnostics compare returned bars against expected exchange sessions; weekends and market holidays are no longer reported as gaps.
+- Genuine missing NYSE sessions are reported as data-gap warnings, including when no bars are returned for an otherwise-open requested range. A range containing only closed sessions does not generate a missing-history warning.
+- Added `--holdout-start` to run separate in-sample and untouched later-period simulations. The holdout uses pre-split bars only for causal indicator warmup; its trades, equity, and benchmark return are restricted to the holdout window.
+- Holdout and in-sample results for each spread scenario persist as distinct ledger runs. The option does not tune parameters; it evaluates the unchanged strategy and configuration.
+- Added `--walk-forward-months` to divide the later period into consecutive out-of-sample windows, each simulated and persisted independently with prior history available only for indicator warmup. This measures temporal consistency; it does not optimize strategy parameters.
+- Added a seeded Monte Carlo bootstrap of each scenario's closed-trade dollar P&L, reporting ending-equity distribution, max drawdowns, losing streaks, probability of loss, and probability of a configured drawdown threshold. It is explicitly limited to trade-order robustness and does not model portfolio re-sizing, compounding, overlaps, or dependence.
+- Added `--universe-file` CSV support for inclusive symbol membership intervals. Signals and next-session entries are constrained by membership dates; open positions continue to be managed after membership ends.
+- Backtest ledgers and reports record the universe source, SHA-256, record count, and full membership snapshot for reproducibility.
+- Added a historical data coverage report comparing each symbol's returned bars to expected NYSE sessions during its membership dates, with counts, percentages, missing-symbol indication, and sample missing dates. Gap diagnostics now exclude dates outside each symbol's membership window.
+- Added a JSON experiment runner for named `TradingConfig` override variants. Experiments share the downloaded bars and execution assumptions, persist under their names/configuration hashes, and cannot be combined with holdout or walk-forward evaluation.
+- The experiment runner performs no search, ranking, or winner selection; its supported workflow is a small, fixed hypothesis comparison on development dates before a separate holdout evaluation.
+- Reviewed [Alpaca historical bars](https://docs.alpaca.markets/us/reference/stockbars) and [feed documentation](https://docs.alpaca.markets/us/docs/historical-stock-data-1): historical bars support inactive-symbol queries and literal-symbol mode (`asof="-"`), but the current adapter uses free IEX-only data, so this does not establish full-market volume or delisted-symbol coverage. Alpaca documents IEX as a single exchange and roughly 2.5% of US volume; SIP represents consolidated all-exchange coverage and requires its eligible subscription.
+- The Alpaca adapter now requests literal symbols to avoid implicit rename mapping when querying historical universe members; each run's coverage audit remains the actual check for returned data.
+- Read-only Alpaca IEX smoke test on 2026-10-18 retrieved bars for four manually selected inactive symbols over their supplied membership windows: TWTR 206/207 sessions (missing 2022-03-08), ATVI 447/447, SIVB 297/297, and BBBY 326/326. The result confirms these example histories can be queried, not complete universe, adjustment, or full-market coverage. No historical bars were saved by the test.
+- The user initially selected EODHD for evaluation, then chose to keep the project Alpaca-only. [EODHD's delisted-symbol documentation](https://eodhd.com/financial-apis/delisted-stock-companies-data-2) says the US inactive-symbol list includes common stocks and standard EOD histories remain available, but the documented list fields do not include listing start/end dates. No account or paid plan was started.
+- Reconsidered data-source preference on 2026-10-18: the user prefers remaining Alpaca-only. A read-only paper trading asset-catalog query returned 33,577 US-equity assets, 19,168 inactive; none of TWTR, ATVI, SIVB, or BBBY were in the catalog, although their bars were retrievable by direct symbol request. Alpaca's current asset catalog therefore cannot be treated as a complete delisted-symbol source or a source of historic listing intervals.
+- Added `--snapshot-alpaca-assets` to capture dated, read-only US-equity asset catalog observations in a dedicated SQLite database (`data/alpaca_assets.sqlite3`). Snapshots are retained append-only with active/inactive status and selected asset attributes; they do not reconstruct pre-snapshot history or count as membership intervals. Backtest survivorship limitations remain.
+- Added read-only `--backtest-history [LIMIT]` and `--backtest-run RUN_ID` commands for chronological run comparison and persisted configuration/trade/equity inspection. They query the existing backtest SQLite database only; missing databases are reported without being created. This supports tracking experiments but does not make incomparable runs statistically comparable.
+- Added configurable `max_sector_exposure_fraction` (default 60% of configured account size) to enforce a per-sector gross market-value cap in backtest entries and all paper-order paths. Current positions and remaining open buy-order notional count for paper entries. Classification uses the shared existing manual symbol map; unknowns share `Unclassified`, and the map remains incomplete.
+- Added a blocking correlation-aware entry guard to backtest and paper entries. It checks absolute Pearson correlation against currently open positions using up to 60 daily returns, at least 30 shared observations, and a configurable 0.85 threshold. The backtest uses history through the signal close; paper mode requests split-adjusted IEX bars through the prior New York date. Insufficient overlap alone is not a block; missing paper histories fail closed. This is descriptive historical correlation, not a predictive risk model.
+- Backtest runs now count entries rejected by that guard; sensitivity reports, persisted SQLite run history, and run-detail views expose the count. SQLite schema version 6 adds the count without assigning historical runs any inferred blocks; read-only views show zero for records created before this field existed.
+- Backtests now size entries to remaining combined planned stop-risk capacity (using whole shares) instead of rejecting every candidate that exceeds the remaining budget. The risk budget is based on marked account equity capped at configured account size, matching the paper bot's balance convention; reports and SQLite schema version 7 include average/peak planned open-risk fractions. Historical runs without these observations show `N/A`, not fabricated values. Planned stop risk does not guarantee maximum loss because of gaps and execution costs.
+- EODHD's [EOD documentation](https://eodhd.com/financial-apis/api-for-historical-data-and-volumes) describes raw OHLC, split-and-dividend-adjusted `adjusted_close`, and split-adjusted volume; that is not a drop-in match for this backtester's split-adjusted OHLC. Its [whole-exchange bulk API](https://eodhd.com/financial-apis/bulk-api-eod-splits-dividends) bills 100 API calls per exchange-date, while standard per-symbol EOD history is one call per symbol; bulk history is not in the free plan. A 1-symbol-per-history approach may be more quota-efficient for an initial sample, but scale and plan entitlements still need checking.
+- [EODHD's terms](https://eodhd.com/financial-apis/terms-conditions) permit private non-commercial analysis for non-professional users, prohibit redistribution, and direct uncertain/commercial use to sales. The intended use/license category must be confirmed before adopting the data. No account was created, credentials were requested, or paid access initiated.
+- [Norgate's US package comparison](https://norgatedata.com/stockmarketpackages.php) explicitly includes delisted securities and historical index constituents in Platinum/Diamond tiers (US data back to 1990/1950), but its [data-access description](https://norgatedata.com/) says it uses a proprietary Windows database and only historical price data can be exported. It appears stronger for historical data research but less directly compatible with this project's general-market CSV universe workflow; constituent export/integration rights and membership scope need confirmation before purchase.
+- Neither an inactive-symbol catalog nor a historical constituent list for selected indices alone is proof of the full, point-in-time NYSE/NASDAQ listing universe needed by this project's broad scanner. Survivorship bias remains unresolved.
+- Next: consider deriving forward-only observed status transitions from successive asset snapshots, with gaps and symbol omissions made explicit; keep these separate from exchange-membership intervals and retain survivorship-bias warnings for historical periods before reliable observations.
+
+---
+
+## Progress Update (2026-10-24): Two purposes and paper automation
+
+- Research remains a standalone ranked-grid scanner (`--research`, also the
+  default mode); it never executes paper orders. Backtest research is retained.
+- The paper bot now synchronizes cumulative partial/full fills with paginated
+  broker order history, preserves new entry plans/configurations, records
+  account observations and operational events, and exposes a local read-only
+  `--paper-performance` report. Legacy fills remain readable.
+- Automatic paper recovery cancels stale/partial entries, verifies quantities,
+  restores original stop/target protection, renews aging exits, and closes
+  verified bot positions when protection cannot be reconstructed/repaired or
+  the configured maximum holding period is reached. Unknown/mixed ownership
+  fails closed rather than liquidating unrelated positions.
+- Recovery requests are persisted before submission and reconciled by client
+  ID across restarts. New buys are paused during uncertain broker state.
+- Added rotating local operational logs and an optional Windows logon task
+  registration script; no task is installed or started automatically.
+- This is implementation progress, not broker validation or evidence of trading
+  success. Actual paper fills/recovery still require a monitored rollout.
+  Fees, external notifications, always-on hosting, and cash-flow-adjusted
+  performance are not implemented. The configured profit target is unchanged.
 
 ---
 

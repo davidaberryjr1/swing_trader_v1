@@ -83,7 +83,15 @@ def _cache_file(cache_dir: Path, symbol: str, period: str) -> Path:
     return cache_dir / f"{quote(symbol, safe='')}__{quote(period, safe='')}.pkl"
 
 
-def _download_chunks(symbols: list[str], period: str, batch_size: int) -> dict[str, pd.DataFrame]:
+def _download_chunks(
+    symbols: list[str],
+    period: str | None,
+    batch_size: int,
+    *,
+    start: str | None = None,
+    end: str | None = None,
+    minimum_bars: int = 30,
+) -> dict[str, pd.DataFrame]:
     import time
 
     results = {}
@@ -91,14 +99,20 @@ def _download_chunks(symbols: list[str], period: str, batch_size: int) -> dict[s
     for idx in range(total_batches):
         chunk = symbols[idx * batch_size : (idx + 1) * batch_size]
         try:
+            request = {
+                "interval": "1d",
+                "auto_adjust": True,
+                "group_by": "ticker",
+                "progress": False,
+                "threads": True,
+            }
+            if start is not None and end is not None:
+                request.update(start=start, end=end)
+            else:
+                request["period"] = period
             df = yf.download(
                 chunk,
-                period=period,
-                interval="1d",
-                auto_adjust=True,
-                group_by="ticker",
-                progress=False,
-                threads=True,
+                **request,
             )
             if df.empty:
                 continue
@@ -108,14 +122,14 @@ def _download_chunks(symbols: list[str], period: str, batch_size: int) -> dict[s
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
                 clean_df = df.dropna()
-                if not clean_df.empty and len(clean_df) >= 30:
+                if not clean_df.empty and len(clean_df) >= minimum_bars:
                     results[ticker] = clean_df
             else:
                 for ticker in chunk:
                     try:
                         if ticker in df:
                             sub_df = df[ticker].dropna()
-                            if not sub_df.empty and len(sub_df) >= 30:
+                            if not sub_df.empty and len(sub_df) >= minimum_bars:
                                 results[ticker] = sub_df
                     except Exception:
                         continue
@@ -127,6 +141,27 @@ def _download_chunks(symbols: list[str], period: str, batch_size: int) -> dict[s
             time.sleep(0.2)
 
     return results
+
+
+def download_history_range(
+    symbols: list[str],
+    start: str,
+    end: str,
+    batch_size: int = 60,
+) -> dict[str, pd.DataFrame]:
+    """Download adjusted daily bars for an explicit date range without the period cache."""
+    if not symbols:
+        return {}
+    if date.fromisoformat(start) > date.fromisoformat(end):
+        raise ValueError("History start date cannot be later than end date")
+    return _download_chunks(
+        symbols,
+        None,
+        batch_size,
+        start=start,
+        end=end,
+        minimum_bars=1,
+    )
 
 
 def _merge_history(cached: pd.DataFrame, update: pd.DataFrame, period: str) -> pd.DataFrame:

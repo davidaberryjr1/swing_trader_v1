@@ -11,6 +11,203 @@ from .backtest import BacktestResult
 
 DEFAULT_BACKTEST_DB = Path("data") / "backtests.sqlite3"
 
+
+def format_backtest_history(path: str | Path = DEFAULT_BACKTEST_DB, limit: int = 20) -> str:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise ValueError("Backtest history limit must be a positive integer")
+    database_path = Path(path)
+    if not database_path.is_file():
+        return "No persisted backtests found; the backtest database does not exist yet.\n"
+    with closing(_open_read_only(database_path)) as database:
+        if not _table_exists(database, "backtest_runs"):
+            return "No persisted backtests found; the backtest database has no run table.\n"
+        blocked_select = (
+            "correlation_blocked_entries"
+            if "correlation_blocked_entries" in _table_columns(database, "backtest_runs")
+            else "0"
+        )
+        columns = _table_columns(database, "backtest_runs")
+        rows = database.execute(
+            """SELECT run_id, created_at, strategy_id, strategy_version, start_date, end_date,
+                      symbols_json, experiment_name, spread_bps, slippage_bps, total_return,
+                      max_drawdown, trade_count, sharpe_ratio, """
+            + blocked_select
+            + """ AS correlation_blocked_entries, """
+            + ("average_open_risk_fraction" if "average_open_risk_fraction" in columns else "NULL")
+            + """ AS average_open_risk_fraction, """
+            + ("peak_open_risk_fraction" if "peak_open_risk_fraction" in columns else "NULL")
+            + """ AS peak_open_risk_fraction
+               FROM backtest_runs
+               ORDER BY created_at DESC, run_id
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    if not rows:
+        return "No persisted backtests found.\n"
+
+    lines = [
+        "# Persisted Backtest History",
+        "",
+        f"Showing {len(rows)} most recent run(s); this is a record view, not a ranking.",
+        "",
+        "| Run ID | Created (UTC) | Strategy | Period | Symbols | Experiment | Spread bps | Slippage bps | Return | Max drawdown | Trades | Corr blocks | Avg open risk | Peak open risk | Sharpe |",
+        "|---|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        (run_id, created_at, strategy_id, strategy_version, start, end, symbols_json,
+         experiment, spread, slippage, total_return, drawdown, trades, sharpe,
+         correlation_blocked_entries, average_open_risk, peak_open_risk) = row
+        symbols = _format_symbols(symbols_json, run_id)
+        lines.append(
+            f"| {_markdown_cell(run_id)} | {_markdown_cell(created_at)} | "
+            f"{_markdown_cell(strategy_id)} {_markdown_cell(strategy_version)} | "
+            f"{start} to {end} | {_markdown_cell(symbols)} | {_markdown_cell(experiment or '-')} | "
+            f"{spread:g} | {slippage:g} | {total_return:.2%} | {drawdown:.2%} | "
+            f"{trades} | {correlation_blocked_entries} | {_format_percent(average_open_risk)} | "
+            f"{_format_percent(peak_open_risk)} | {_format_number(sharpe)} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def format_backtest_run(run_id: str, path: str | Path = DEFAULT_BACKTEST_DB) -> str:
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("A non-empty backtest run ID is required")
+    database_path = Path(path)
+    if not database_path.is_file():
+        raise ValueError(f"Backtest database does not exist: {database_path}")
+    with closing(_open_read_only(database_path)) as database:
+        if not _table_exists(database, "backtest_runs"):
+            raise ValueError(f"Backtest database has no run table: {database_path}")
+        database.row_factory = sqlite3.Row
+        blocked_select = (
+            "correlation_blocked_entries"
+            if "correlation_blocked_entries" in _table_columns(database, "backtest_runs")
+            else "0 AS correlation_blocked_entries"
+        )
+        columns = _table_columns(database, "backtest_runs")
+        risk_select = ", ".join(
+            column if column in columns else f"NULL AS {column}"
+            for column in ("average_open_risk_fraction", "peak_open_risk_fraction")
+        )
+        run = database.execute(
+            "SELECT *, " + blocked_select + ", " + risk_select
+            + " FROM backtest_runs WHERE run_id = ?",
+            (run_id.strip(),),
+        ).fetchone()
+        if run is None:
+            raise ValueError(f"Backtest run not found: {run_id}")
+        trades = database.execute(
+            "SELECT trade_number, symbol, entry_date, exit_date, entry_price, exit_price, shares, "
+            "exit_reason, realized_pnl, realized_r FROM backtest_trades "
+            "WHERE run_id = ? ORDER BY trade_number",
+            (run_id.strip(),),
+        ).fetchall() if _table_exists(database, "backtest_trades") else []
+        equity = database.execute(
+            "SELECT session_date, equity FROM backtest_equity "
+            "WHERE run_id = ? ORDER BY session_date",
+            (run_id.strip(),),
+        ).fetchall() if _table_exists(database, "backtest_equity") else []
+
+    lines = [
+        f"# Backtest Run {run['run_id']}",
+        "",
+        f"- Created (UTC): {run['created_at']}",
+        f"- Strategy: {run['strategy_id']} {run['strategy_version']}",
+        f"- Period: {run['start_date']} to {run['end_date']}",
+        f"- Symbols: {_markdown_cell(_format_symbols(run['symbols_json'], run_id))}",
+        f"- Experiment: {_markdown_cell(run['experiment_name'] or '-')}",
+        f"- Configuration SHA-256: `{run['configuration_hash']}`",
+        f"- Execution: spread {run['spread_bps']:g} bps; slippage {run['slippage_bps']:g} bps per fill; "
+        f"commission ${run['commission_per_share']:g}/share/side; target fill `{run['target_fill_mode']}` "
+        f"with {run['target_trade_through_bps']:g} bps trade-through",
+        f"- Universe source: {_markdown_cell(run['universe_source'] or 'explicit symbols')}",
+        f"- Universe SHA-256: `{run['universe_sha256'] or 'N/A'}`; records: {run['universe_record_count']}",
+        "",
+        "## Performance",
+        "",
+        "| Starting equity | Ending equity | Return | CAGR | Benchmark return | Alpha | Max drawdown | Sharpe | Trades | Corr blocks | Avg open risk | Peak open risk | Win rate | Expectancy | Profit factor |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| ${run['starting_equity']:,.2f} | ${run['ending_equity']:,.2f} | {run['total_return']:.2%} | "
+        f"{_format_percent(run['cagr'])} | {_format_percent(run['benchmark_return'])} | "
+        f"{_format_percent(run['benchmark_alpha'])} | {run['max_drawdown']:.2%} | "
+        f"{_format_number(run['sharpe_ratio'])} | {run['trade_count']} | "
+        f"{run['correlation_blocked_entries']} | "
+        f"{_format_percent(run['average_open_risk_fraction'])} | "
+        f"{_format_percent(run['peak_open_risk_fraction'])} | {run['win_rate']:.2%} | "
+        f"${run['expectancy_dollars']:,.2f} | {_format_number(run['profit_factor'])} |",
+        "",
+        "## Configuration",
+        "",
+        "```json",
+    ]
+    try:
+        configuration = json.dumps(json.loads(run["configuration_json"]), indent=2, sort_keys=True)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Backtest run {run_id} has invalid configuration JSON") from exc
+    lines.extend([configuration, "```", "", "## Trades", ""])
+    if trades:
+        lines.extend([
+            "| # | Symbol | Entry | Exit | Entry price | Exit price | Shares | Exit reason | P&L | R |",
+            "|---:|---|---|---|---:|---:|---:|---|---:|---:|",
+        ])
+        lines.extend(
+            f"| {trade['trade_number']} | {_markdown_cell(trade['symbol'])} | {trade['entry_date']} | "
+            f"{trade['exit_date']} | ${trade['entry_price']:.2f} | ${trade['exit_price']:.2f} | "
+            f"{trade['shares']} | {_markdown_cell(trade['exit_reason'])} | "
+            f"${trade['realized_pnl']:,.2f} | {trade['realized_r']:.2f} |"
+            for trade in trades
+        )
+    else:
+        lines.append("No closed trades were recorded for this run.")
+    lines.extend(["", "## Equity curve", ""])
+    if equity:
+        lines.append(
+            f"{len(equity)} daily point(s), from {equity[0]['session_date']} "
+            f"(${equity[0]['equity']:,.2f}) through {equity[-1]['session_date']} "
+            f"(${equity[-1]['equity']:,.2f})."
+        )
+    else:
+        lines.append("No daily equity points were recorded for this run.")
+    return "\n".join(lines) + "\n"
+
+
+def _open_read_only(path: Path) -> sqlite3.Connection:
+    return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+
+
+def _table_exists(database: sqlite3.Connection, table_name: str) -> bool:
+    return database.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone() is not None
+
+
+def _table_columns(database: sqlite3.Connection, table_name: str) -> set[str]:
+    return {row[1] for row in database.execute(f"PRAGMA table_info({table_name})")}
+
+
+def _markdown_cell(value: str) -> str:
+    return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def _format_number(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.3f}"
+
+
+def _format_percent(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.2%}"
+
+
+def _format_symbols(symbols_json: str, run_id: str) -> str:
+    try:
+        symbols = json.loads(symbols_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Backtest run {run_id} has invalid symbols JSON") from exc
+    if not isinstance(symbols, list) or any(not isinstance(symbol, str) for symbol in symbols):
+        raise ValueError(f"Backtest run {run_id} has invalid symbols JSON")
+    return ", ".join(symbols)
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS backtest_runs (
     run_id TEXT PRIMARY KEY,
@@ -50,15 +247,23 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     max_consecutive_losses INTEGER NOT NULL,
     average_holding_sessions REAL NOT NULL,
     average_gross_exposure REAL NOT NULL DEFAULT 0,
+    average_open_risk_fraction REAL,
+    peak_open_risk_fraction REAL,
     turnover REAL NOT NULL DEFAULT 0,
     market_regime_json TEXT NOT NULL DEFAULT '{}',
     sector_mapping_json TEXT NOT NULL DEFAULT '{}',
     sector_exposure_json TEXT NOT NULL DEFAULT '{}',
     average_pairwise_correlation REAL,
     max_pairwise_correlation REAL,
+    correlation_blocked_entries INTEGER NOT NULL DEFAULT 0,
     sector_etf_mapping_json TEXT NOT NULL DEFAULT '{}',
     average_relative_strength_vs_market REAL,
-    average_relative_strength_vs_sector REAL
+    average_relative_strength_vs_sector REAL,
+    universe_source TEXT,
+    universe_sha256 TEXT,
+    universe_membership_json TEXT NOT NULL DEFAULT '{}',
+    universe_record_count INTEGER NOT NULL DEFAULT 0,
+    experiment_name TEXT
 );
 CREATE TABLE IF NOT EXISTS backtest_trades (
     run_id TEXT NOT NULL,
@@ -113,6 +318,11 @@ def persist_sensitivity_results(
     commission_per_share: float,
     target_fill_mode: str,
     target_trade_through_bps: float,
+    universe_source: str | None = None,
+    universe_sha256: str | None = None,
+    universe_membership_json: str = "{}",
+    universe_record_count: int = 0,
+    experiment_name: str | None = None,
     path: str | Path = DEFAULT_BACKTEST_DB,
 ) -> list[str]:
     if not results:
@@ -127,15 +337,23 @@ def persist_sensitivity_results(
         database.execute("PRAGMA foreign_keys = ON")
         database.executescript(_SCHEMA)
         _ensure_column(database, "backtest_runs", "average_gross_exposure", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(database, "backtest_runs", "average_open_risk_fraction", "REAL")
+        _ensure_column(database, "backtest_runs", "peak_open_risk_fraction", "REAL")
         _ensure_column(database, "backtest_runs", "turnover", "REAL NOT NULL DEFAULT 0")
         _ensure_column(database, "backtest_runs", "market_regime_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(database, "backtest_runs", "sector_mapping_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(database, "backtest_runs", "sector_exposure_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(database, "backtest_runs", "average_pairwise_correlation", "REAL")
         _ensure_column(database, "backtest_runs", "max_pairwise_correlation", "REAL")
+        _ensure_column(database, "backtest_runs", "correlation_blocked_entries", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(database, "backtest_runs", "sector_etf_mapping_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(database, "backtest_runs", "average_relative_strength_vs_market", "REAL")
         _ensure_column(database, "backtest_runs", "average_relative_strength_vs_sector", "REAL")
+        _ensure_column(database, "backtest_runs", "universe_source", "TEXT")
+        _ensure_column(database, "backtest_runs", "universe_sha256", "TEXT")
+        _ensure_column(database, "backtest_runs", "universe_membership_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(database, "backtest_runs", "universe_record_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(database, "backtest_runs", "experiment_name", "TEXT")
         _ensure_column(database, "backtest_trades", "sector", "TEXT NOT NULL DEFAULT 'Unclassified'")
         _ensure_column(database, "backtest_trades", "sector_etf", "TEXT")
         _ensure_column(database, "backtest_trades", "market_regime", "TEXT NOT NULL DEFAULT 'UNKNOWN'")
@@ -144,7 +362,7 @@ def persist_sensitivity_results(
         _ensure_column(database, "backtest_trades", "sector_return_20d", "REAL")
         _ensure_column(database, "backtest_trades", "relative_strength_vs_market", "REAL")
         _ensure_column(database, "backtest_trades", "relative_strength_vs_sector", "REAL")
-        database.execute("PRAGMA user_version = 3")
+        database.execute("PRAGMA user_version = 7")
         with database:
             for spread_bps, result in results:
                 run_id = str(uuid4())
@@ -159,10 +377,14 @@ def persist_sensitivity_results(
                         sortino_ratio, calmar_ratio, trade_count, win_rate, average_win,
                         average_loss, median_win, median_loss, expectancy_dollars, average_r,
                         profit_factor, max_consecutive_losses, average_holding_sessions,
-                        average_gross_exposure, turnover, market_regime_json, sector_mapping_json,
+                        average_gross_exposure, average_open_risk_fraction, peak_open_risk_fraction,
+                        turnover, market_regime_json, sector_mapping_json,
                         sector_exposure_json, average_pairwise_correlation, max_pairwise_correlation,
+                        correlation_blocked_entries,
                         sector_etf_mapping_json, average_relative_strength_vs_market,
-                        average_relative_strength_vs_sector
+                        average_relative_strength_vs_sector, universe_source,
+                        universe_sha256, universe_membership_json, universe_record_count,
+                        experiment_name
                     ) VALUES (
                         :run_id, :created_at, :strategy_id, :strategy_version, :configuration_hash,
                         :configuration_json, :symbols_json, :start_date, :end_date, :slippage_bps,
@@ -172,10 +394,14 @@ def persist_sensitivity_results(
                         :sortino_ratio, :calmar_ratio, :trade_count, :win_rate, :average_win,
                         :average_loss, :median_win, :median_loss, :expectancy_dollars, :average_r,
                         :profit_factor, :max_consecutive_losses, :average_holding_sessions,
-                        :average_gross_exposure, :turnover, :market_regime_json, :sector_mapping_json,
+                        :average_gross_exposure, :average_open_risk_fraction, :peak_open_risk_fraction,
+                        :turnover, :market_regime_json, :sector_mapping_json,
                         :sector_exposure_json, :average_pairwise_correlation, :max_pairwise_correlation,
+                        :correlation_blocked_entries,
                         :sector_etf_mapping_json, :average_relative_strength_vs_market,
-                        :average_relative_strength_vs_sector
+                        :average_relative_strength_vs_sector, :universe_source,
+                        :universe_sha256, :universe_membership_json, :universe_record_count,
+                        :experiment_name
                     )""",
                     {
                         "run_id": run_id,
@@ -215,6 +441,8 @@ def persist_sensitivity_results(
                         "max_consecutive_losses": result.max_consecutive_losses,
                         "average_holding_sessions": result.average_holding_sessions,
                         "average_gross_exposure": result.average_gross_exposure,
+                        "average_open_risk_fraction": result.average_open_risk_fraction,
+                        "peak_open_risk_fraction": result.peak_open_risk_fraction,
                         "turnover": result.turnover,
                         "market_regime_json": json.dumps(
                             {
@@ -231,9 +459,15 @@ def persist_sensitivity_results(
                         "sector_exposure_json": json.dumps(result.sector_exposure_metrics, sort_keys=True, allow_nan=False),
                         "average_pairwise_correlation": result.average_pairwise_correlation,
                         "max_pairwise_correlation": result.max_pairwise_correlation,
+                        "correlation_blocked_entries": result.correlation_blocked_entries,
                         "sector_etf_mapping_json": json.dumps(result.sector_etf_mapping, sort_keys=True, allow_nan=False),
                         "average_relative_strength_vs_market": result.average_relative_strength_vs_market,
                         "average_relative_strength_vs_sector": result.average_relative_strength_vs_sector,
+                        "universe_source": universe_source,
+                        "universe_sha256": universe_sha256,
+                        "universe_membership_json": universe_membership_json,
+                        "universe_record_count": universe_record_count,
+                        "experiment_name": experiment_name,
                     },
                 )
                 database.executemany(

@@ -5,3 +5,4 @@ ta>=0.11
 matplotlib>=3.9
 vaderSentiment>=3.3
 alpaca-py>=0.40
+pandas-market-calendars>=5.1

@@ -39,7 +39,14 @@ class TradingConfig:
     max_open_positions: int = 5
     daily_loss_fraction: float = 0.02
     max_combined_risk_fraction: float = 0.10
-    bot_poll_seconds: int = 300
+    max_sector_exposure_fraction: float = 0.60
+    # Block entries at or above this absolute daily-return correlation.
+    correlation_lookback_sessions: int = 60
+    correlation_min_observations: int = 30
+    correlation_absolute_threshold: float = 0.85
+    bot_auto_recover: bool = True
+    bot_max_hold_days: int = 180
+    bot_poll_seconds: int = 30
     bot_scan_interval_seconds: int = 900
 
 

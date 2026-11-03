@@ -16,6 +16,8 @@ __pycache__/
 /data/scans/*.md
 /data/cache/
 /data/paper_fills.sqlite3
+/data/paper_fills.sqlite3-*
+/data/paper_bot.log*
 /data/paper_bot.lock
 
 # Local environment and secrets
