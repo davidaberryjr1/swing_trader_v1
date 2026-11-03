@@ -125,6 +125,7 @@ def _download_chunks(
     start: str | None = None,
     end: str | None = None,
     minimum_bars: int = 30,
+    checked: set[str] | None = None,
 ) -> dict[str, pd.DataFrame]:
     import time
 
@@ -267,7 +268,7 @@ def download_batch(
                 batch_size,
                 start=window_start.isoformat(),
                 end=end_date,
-                minimum_rows=1,
+                minimum_bars=1,
                 checked=checked,
             )
         )
@@ -280,7 +281,7 @@ def download_batch(
                 batch_size,
                 start=start_date,
                 end=end_date,
-                minimum_rows=1,
+                minimum_bars=1,
                 checked=checked,
             )
         )
