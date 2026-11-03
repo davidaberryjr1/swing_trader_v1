@@ -619,8 +619,35 @@ def bot_lock(path=BOT_LOCK_PATH):
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-def main():
+def main(argv=None):
     started_at = perf_counter()
+    arguments = sys.argv[1:] if argv is None else argv
+    if not arguments:
+        launch_gui(
+            cfg=build_config(minimum_price=None, maximum_price=None),
+            symbols=None,
+            output_path=None,
+            top=25,
+        )
+        return
+    if "--gui" in arguments:
+        gui_parser = argparse.ArgumentParser(description="Open the Kivy scanner interface")
+        gui_parser.add_argument("--gui", action="store_true")
+        gui_parser.add_argument("--symbols", nargs="+")
+        gui_parser.add_argument("--output")
+        gui_parser.add_argument("--top", type=int, default=25)
+        gui_parser.add_argument("--min-price", type=float)
+        gui_parser.add_argument("--max-price", type=float)
+        gui_args = gui_parser.parse_args(arguments)
+        if gui_args.top <= 0:
+            gui_parser.error("--top must be greater than zero")
+        launch_gui(
+            cfg=build_config(minimum_price=gui_args.min_price, maximum_price=gui_args.max_price),
+            symbols=gui_args.symbols,
+            output_path=gui_args.output,
+            top=gui_args.top,
+        )
+        return
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     suffix = 0
@@ -723,7 +750,7 @@ def main():
             paper_modes.add_argument("--paper-bot", action="store_true", help="Reconcile continuously and rescan for open paper slots")
             paper_modes.add_argument("--paper-bot-once", action="store_true", help="Run one guarded paper bot cycle and exit")
 
-            args = parser.parse_args()
+            args = parser.parse_args(arguments)
             paper_mode = any((
                 args.paper_preview, args.paper_trade, args.paper_status, args.paper_performance,
                 args.paper_reconcile, args.paper_bot, args.paper_bot_once,
@@ -779,6 +806,90 @@ def main():
                     parser.error("--snapshot-alpaca-assets cannot be combined with other operating modes")
                 run_alpaca_asset_snapshot()
             elif args.backtest:
+                if not args.start or not args.end:
+                    parser.error("--backtest requires both --start and --end")
+                if args.holdout_start:
+                    try:
+                        valid_holdout = (
+                            date.fromisoformat(args.start)
+                            < date.fromisoformat(args.holdout_start)
+                            <= date.fromisoformat(args.end)
+                        )
+                    except ValueError:
+                        parser.error("--holdout-start must use YYYY-MM-DD")
+                    if not valid_holdout:
+                        parser.error("--holdout-start must be later than --start and no later than --end")
+                if args.walk_forward_months is not None:
+                    if not args.holdout_start:
+                        parser.error("--walk-forward-months requires --holdout-start")
+                    if args.walk_forward_months < 1:
+                        parser.error("--walk-forward-months must be at least 1")
+                if args.monte_carlo_simulations < 1:
+                    parser.error("--monte-carlo-simulations must be at least 1")
+                if not -1 <= args.monte_carlo_drawdown_threshold <= 0:
+                    parser.error("--monte-carlo-drawdown-threshold must be between -1 and 0")
+                config = build_config(minimum_price=args.min_price, maximum_price=args.max_price)
+                run_backtest_cli(
+                    args.symbols,
+                    args.start,
+                    args.end,
+                    config,
+                    slippage_bps=args.slippage_bps,
+                    spread_bps=args.spread_bps,
+                    spread_scenarios_bps=args.spread_scenarios_bps,
+                    commission_per_share=args.commission_per_share,
+                    target_fill_mode=args.target_fill_mode,
+                    target_trade_through_bps=args.target_trade_through_bps,
+                    holdout_start=args.holdout_start,
+                    walk_forward_months=args.walk_forward_months,
+                    monte_carlo_simulations=args.monte_carlo_simulations,
+                    monte_carlo_drawdown_threshold=args.monte_carlo_drawdown_threshold,
+                    universe_file=args.universe_file,
+                    experiment_file=args.experiment_file,
+                )
+            elif args.universe_file or args.experiment_file:
+                parser.error("--universe-file and --experiment-file can only be used with --backtest")
+            elif args.paper_performance:
+                from swingtrader.paper_journal import format_paper_performance
+
+                print(format_paper_performance(), end="")
+            elif args.paper_status or args.paper_reconcile:
+                from swingtrader.paper_trading import report_paper_status
+
+                report_paper_status(cancel_stale=args.paper_reconcile)
+            elif args.paper_bot or args.paper_bot_once:
+                config = build_config(minimum_price=args.min_price, maximum_price=args.max_price)
+                with bot_lock():
+                    run_paper_bot(config, symbols=args.symbols, top=args.top, once=args.paper_bot_once)
+            else:
+                config = build_config(
+                    minimum_price=args.min_price,
+                    maximum_price=args.max_price,
+                )
+                candidates = run_scanner(
+                    symbols=args.symbols,
+                    output_path=args.output,
+                    top=args.top,
+                    cfg=config,
+                )
+                if args.paper_preview or args.paper_trade:
+                    if not candidates:
+                        print("No candidate available for a paper order.")
+                    else:
+                        from swingtrader.paper_trading import submit_paper_candidate
+
+                        try:
+                            plan = submit_paper_candidate(candidates[0], config, execute=args.paper_trade)
+                            print(f"\n## Alpaca Paper {'Order' if args.paper_trade else 'Preview'}\n")
+                            print(f"{plan.symbol}: buy {plan.shares} @ <= ${plan.limit_price:.2f}; "
+                                  f"stop ${plan.stop_price:.2f}; take profit ${plan.target_price:.2f}; "
+                                  f"planned risk ${plan.risk_dollars:.2f}")
+                        except ValueError as exc:
+                            print(f"\nPaper order skipped: {exc}")
+        finally:
+            elapsed = perf_counter() - started_at
+            print(f"\nTotal application runtime: {elapsed:.2f} seconds")
+    print(f"Saved Markdown report to {report_path}")
 GUI_COLUMN_LABELS = [
     "Rank", "Symbol", "Score", "P(+10%)", "P(-5%)",
     "Risk", "Entry", "Stop", "+1% Target",
@@ -975,7 +1086,12 @@ def launch_gui(cfg, symbols=None, output_path=None, top=25):
     import os
     from threading import Thread
 
-    from kivy.config import Config
+    original_argv = sys.argv
+    try:
+        sys.argv = [sys.argv[0]]
+        from kivy.config import Config
+    finally:
+        sys.argv = original_argv
 
     if os.name == "nt":
         Config.set("graphics", "multisamples", "0")
@@ -1438,7 +1554,12 @@ def launch_gui(cfg, symbols=None, output_path=None, top=25):
             self.scan_status.text = status_text or f"Scan complete: {len(candidates)} candidates."
             self.scan_button.disabled = False
 
-    SwingTraderGUI().run()
+    original_argv = sys.argv
+    try:
+        sys.argv = [sys.argv[0]]
+        SwingTraderGUI().run()
+    finally:
+        sys.argv = original_argv
 
 
 def create_argument_parser():
@@ -1490,7 +1611,7 @@ def create_argument_parser():
     return parser
 
 
-def main(argv=None):
+def legacy_main(argv=None):
     started_at = perf_counter()
     arguments = sys.argv[1:] if argv is None else argv
     parser = create_argument_parser()

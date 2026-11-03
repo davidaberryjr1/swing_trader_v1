@@ -86,6 +86,37 @@ def _cache_file(cache_dir: Path, symbol: str, period: str) -> Path:
     return cache_dir / f"{quote(symbol, safe='')}__{quote(period, safe='')}.pkl"
 
 
+def load_cached_daily_close(
+    symbol: str,
+    cache_dir: str | Path = "data/cache/ohlcv",
+    *,
+    include_sma_warmup: bool = False,
+) -> pd.Series | None:
+    """Load cached adjusted daily closes, optionally including SMA warm-up bars."""
+    path = _cache_file(Path(cache_dir), symbol, "1y")
+    if not path.is_file():
+        return None
+
+    try:
+        history = pd.read_pickle(path)
+    except (OSError, ValueError, TypeError, EOFError) as exc:
+        raise ValueError(f"Unable to read cached daily history for {symbol}: {exc}") from exc
+
+    if "Close" not in history:
+        raise ValueError(f"Cached daily history for {symbol} has no Close column")
+
+    close = history["Close"].dropna().sort_index()
+    if close.empty:
+        return close
+
+    cutoff = close.index[-1] - pd.Timedelta(days=365)
+    if include_sma_warmup:
+        visible_start = close.index.searchsorted(cutoff)
+        warmup_start = max(0, visible_start - SMA_WARMUP_SESSIONS)
+        return close.iloc[warmup_start:]
+    return close.loc[close.index >= cutoff]
+
+
 def _download_chunks(
     symbols: list[str],
     period: str | None,
