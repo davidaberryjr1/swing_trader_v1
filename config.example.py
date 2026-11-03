@@ -26,7 +26,13 @@ TRADING_CONFIG = TradingConfig(
 	estimated_exit_cost_fraction=0.001,   # Paper target: 0.1% allowance for estimated sale costs.
 	max_open_positions=5,                 # Bot: positions plus pending entries.
 	daily_loss_fraction=0.02,             # Bot: pause new buys after 2% daily account loss.
-	max_combined_risk_fraction=0.10,      # Bot: maximum planned downside across open trades.
-	bot_poll_seconds=300,                 # Bot: reconcile broker orders every five minutes.
+	max_combined_risk_fraction=0.10,      # Backtest and bot: max planned stop risk across open trades.
+	max_sector_exposure_fraction=0.60,    # Backtests and paper: gross market-value cap per sector.
+	correlation_lookback_sessions=60,     # Correlated-entry guard: daily return lookback.
+	correlation_min_observations=30,      # Correlated-entry guard: minimum shared returns.
+	correlation_absolute_threshold=0.85,  # Correlated-entry guard: block at/above absolute correlation.
+	bot_auto_recover=True,                # Paper bot: repair exits or close verified bot positions.
+	bot_max_hold_days=180,                # Paper bot: close positions at this age during regular hours.
+	bot_poll_seconds=30,                  # Bot: reconcile broker state every thirty seconds.
 	bot_scan_interval_seconds=900,        # Bot: rescan open slots every fifteen minutes.
 )

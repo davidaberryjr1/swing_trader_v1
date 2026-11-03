@@ -5,18 +5,28 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 
 from swingtrader.backtest import (
     _historical_strategy,
     _market_regimes,
+    build_walk_forward_windows,
     configuration_hash,
     format_spread_sensitivity_report,
+    monte_carlo_trade_bootstrap,
     run_backtest,
 )
-from swingtrader.backtest_store import persist_sensitivity_results
+from swingtrader.backtest_store import (
+    format_backtest_history,
+    format_backtest_run,
+    persist_sensitivity_results,
+)
 from swingtrader.config import TradingConfig
+from swingtrader.experiments import load_config_experiments
+from swingtrader.historical_universe import load_historical_universe
 from swingtrader.scanner import TradeCandidate
 
 
@@ -77,6 +87,108 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(trade.exit_reason, "stop_gap")
         self.assertEqual(trade.exit_price, 8.0)
 
+    def test_sector_exposure_cap_blocks_same_sector_entry_but_allows_other_sector(self):
+        dates = pd.date_range("2025-01-02", periods=3)
+        bars = pd.DataFrame(
+            {"Open": [10.0] * 3, "High": [10.05] * 3, "Low": [9.95] * 3,
+             "Close": [10.0] * 3, "Volume": [1_000_000] * 3},
+            index=dates,
+        )
+        histories = {"F": bars, "CCL": bars, "BAC": bars}
+
+        def strategy(symbol, history, _cfg):
+            return candidate(symbol) if len(history) == 1 else None
+
+        result = run_backtest(
+            histories,
+            replace(self.cfg, max_sector_exposure_fraction=0.15),
+            slippage_bps=0,
+            strategy=strategy,
+        )
+
+        entered = {trade.symbol for trade in result.trades}
+        self.assertEqual(entered, {"F", "BAC"})
+
+    def test_combined_risk_budget_resizes_candidate_and_tracks_exposure(self):
+        dates = pd.date_range("2025-01-02", periods=3)
+        bars = pd.DataFrame(
+            {"Open": [10.0] * 3, "High": [10.05] * 3, "Low": [9.95] * 3,
+             "Close": [10.0] * 3, "Volume": [1_000_000] * 3},
+            index=dates,
+        )
+
+        def strategy(symbol, history, _cfg):
+            return candidate(symbol) if len(history) == 1 else None
+
+        result = run_backtest(
+            {"F": bars, "BAC": bars},
+            replace(self.cfg, max_combined_risk_fraction=0.015),
+            slippage_bps=0,
+            strategy=strategy,
+        )
+
+        self.assertEqual({trade.symbol: trade.shares for trade in result.trades}, {"F": 10, "BAC": 5})
+        self.assertAlmostEqual(result.peak_open_risk_fraction, 0.015)
+        self.assertAlmostEqual(result.average_open_risk_fraction, 0.01)
+
+    def test_correlation_guard_blocks_second_correlated_entry(self):
+        dates = pd.bdate_range("2025-01-02", periods=45)
+        returns = np.sin(np.arange(len(dates)) * 0.7) * 0.002
+        close = 10 * np.cumprod(1 + returns)
+        bars = pd.DataFrame(
+            {"Open": close, "High": close * 1.005, "Low": close * 0.995,
+             "Close": close, "Volume": [1_000_000] * len(dates)},
+            index=dates,
+        )
+
+        def strategy(symbol, history, _cfg):
+            return candidate(symbol) if len(history) == 40 else None
+
+        result = run_backtest(
+            {"F": bars, "BAC": bars},
+            self.cfg,
+            slippage_bps=0,
+            strategy=strategy,
+        )
+
+        self.assertEqual({trade.symbol for trade in result.trades}, {"F"})
+        self.assertEqual(result.correlation_blocked_entries, 1)
+        report = format_spread_sensitivity_report(
+            [(0.0, result)],
+            run_ids=["guard-test"],
+            database_path="backtests.sqlite3",
+            symbols=["F", "BAC"],
+            start=dates[0].date().isoformat(),
+            end=dates[-1].date().isoformat(),
+            slippage_bps=0,
+            commission_per_share=0.005,
+            target_fill_mode="trade_through",
+            target_trade_through_bps=5,
+            monte_carlo_simulations=10,
+        )
+        self.assertIn("| 1 | 1 |", report)
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "backtests.sqlite3"
+            run_ids = persist_sensitivity_results(
+                [(0.0, result)],
+                symbols=["F", "BAC"],
+                start=dates[0].date().isoformat(),
+                end=dates[-1].date().isoformat(),
+                slippage_bps=0,
+                commission_per_share=0.005,
+                target_fill_mode="trade_through",
+                target_trade_through_bps=5,
+                path=database_path,
+            )
+            with closing(sqlite3.connect(database_path)) as database:
+                persisted_count = database.execute(
+                    "SELECT correlation_blocked_entries FROM backtest_runs WHERE run_id = ?",
+                    (run_ids[0],),
+                ).fetchone()[0]
+            self.assertEqual(persisted_count, 1)
+            self.assertIn("| 1 | 1 |", format_backtest_history(database_path))
+            self.assertIn("| 1 | 1 |", format_backtest_run(run_ids[0], database_path))
+
     def test_future_bars_cannot_change_prior_strategy_inputs(self):
         dates = pd.date_range("2025-01-02", periods=4)
         past = pd.DataFrame(
@@ -106,6 +218,215 @@ class BacktestTests(unittest.TestCase):
 
         pd.testing.assert_frame_equal(first_run[1], observed[1])
         self.assertEqual(first_run[1].index[-1], dates[1])
+
+    def test_simulation_window_uses_prior_bars_for_warmup_without_trading_them(self):
+        dates = pd.to_datetime(["2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07", "2025-01-08"])
+        bars = pd.DataFrame(
+            {"Open": [10.0] * 5, "High": [10.2] * 5, "Low": [9.8] * 5,
+             "Close": [10.0] * 5, "Volume": [1_000_000] * 5},
+            index=dates,
+        )
+        benchmark = pd.DataFrame(
+            {"Open": [100.0, 101.0, 102.0, 103.0, 104.0],
+             "High": [101.0, 102.0, 103.0, 104.0, 105.0],
+             "Low": [99.0, 100.0, 101.0, 102.0, 103.0],
+             "Close": [100.5, 101.5, 102.5, 103.5, 104.5]},
+            index=dates,
+        )
+        observed_signal_dates = []
+
+        def strategy(_symbol, history, _cfg):
+            observed_signal_dates.append(history.index[-1])
+            return candidate() if history.index[-1] == dates[2] else None
+
+        result = run_backtest(
+            {"TEST": bars},
+            self.cfg,
+            slippage_bps=0,
+            strategy=strategy,
+            benchmark=benchmark,
+            simulation_start="2025-01-06",
+            simulation_end="2025-01-07",
+        )
+
+        self.assertEqual(observed_signal_dates, [dates[2]])
+        self.assertEqual(result.equity_curve.index.tolist(), list(dates[2:4]))
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_date, "2025-01-07")
+        self.assertEqual(result.trades[0].exit_date, "2025-01-07")
+        self.assertAlmostEqual(result.benchmark_return, 103.5 / 102.0 - 1)
+
+    def test_simulation_window_rejects_empty_or_reversed_dates(self):
+        dates = pd.date_range("2025-01-02", periods=2)
+        bars = pd.DataFrame(
+            {"Open": [10.0] * 2, "High": [10.2] * 2, "Low": [9.8] * 2,
+             "Close": [10.0] * 2, "Volume": [1_000_000] * 2},
+            index=dates,
+        )
+
+        with self.assertRaisesRegex(ValueError, "No historical bars available inside"):
+            run_backtest(
+                {"TEST": bars}, self.cfg,
+                simulation_start="2025-01-10", simulation_end="2025-01-10",
+            )
+        with self.assertRaisesRegex(ValueError, "start date cannot be later"):
+            run_backtest(
+                {"TEST": bars}, self.cfg,
+                simulation_start="2025-01-03", simulation_end="2025-01-02",
+            )
+
+    def test_historical_universe_membership_gates_signals_and_next_open_entries(self):
+        dates = pd.to_datetime([
+            "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07", "2025-01-08",
+        ])
+        bars = pd.DataFrame(
+            {"Open": [10.0] * 5, "High": [10.05] * 5, "Low": [9.95] * 5,
+             "Close": [10.0] * 5, "Volume": [1_000_000] * 5},
+            index=dates,
+        )
+        observed = []
+
+        def strategy(_symbol, history, _cfg):
+            observed.append(history.index[-1])
+            return candidate() if history.index[-1] in dates[[1, 2]] else None
+
+        result = run_backtest(
+            {"TEST": bars},
+            self.cfg,
+            slippage_bps=0,
+            strategy=strategy,
+            universe_membership={"TEST": ((dates[1].date(), dates[2].date()),)},
+        )
+
+        self.assertEqual(observed, [dates[1], dates[2]])
+        self.assertEqual(len(result.trades), 1)
+        self.assertEqual(result.trades[0].entry_date, "2025-01-06")
+        self.assertEqual(result.trades[0].exit_date, "2025-01-08")
+
+    def test_historical_universe_loads_normalized_intervals_and_provenance(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "members.csv"
+            path.write_text(
+                "symbol,start_date,end_date\n"
+                "test,2020-01-01,2020-12-31\n"
+                "TEST,2021-01-01,\n"
+                "OTHER,2022-01-01,2022-01-31\n",
+                encoding="utf-8",
+            )
+
+            universe = load_historical_universe(path)
+
+        self.assertEqual(universe.symbols, ["OTHER", "TEST"])
+        self.assertEqual(universe.record_count, 3)
+        self.assertEqual(len(universe.sha256), 64)
+        self.assertTrue(universe.is_member("TEST", pd.Timestamp("2020-12-31").date()))
+        self.assertTrue(universe.is_member("TEST", pd.Timestamp("2021-01-01").date()))
+        self.assertEqual(
+            universe.symbols_overlapping(
+                pd.Timestamp("2021-06-01").date(), pd.Timestamp("2021-12-31").date(),
+            ),
+            ["TEST"],
+        )
+        self.assertIn('"end_date":null', universe.to_json())
+
+    def test_historical_universe_rejects_overlapping_or_malformed_intervals(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "members.csv"
+            path.write_text(
+                "symbol,start_date,end_date\nTEST,2020-01-01,\nTEST,2021-01-01,2022-01-01\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "open-ended membership"):
+                load_historical_universe(path)
+
+            path.write_text(
+                "symbol,start_date,end_date\nTEST,20200101,2022-01-01\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
+                load_historical_universe(path)
+
+    def test_config_experiments_apply_named_typed_overrides(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "experiments.json"
+            path.write_text(
+                '{"experiments":['
+                '{"name":"base","overrides":{}},'
+                '{"name":"higher-risk","overrides":{"risk_fraction":0.02}}'
+                ']}',
+                encoding="utf-8",
+            )
+
+            experiments = load_config_experiments(path, self.cfg)
+
+        self.assertEqual([name for name, _ in experiments], ["base", "higher-risk"])
+        self.assertEqual(experiments[0][1], self.cfg)
+        self.assertEqual(experiments[1][1].risk_fraction, 0.02)
+
+    def test_config_experiments_reject_unknown_or_invalid_values(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "experiments.json"
+            path.write_text(
+                '{"experiments":[{"name":"bad","overrides":{"future_parameter":1}}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unknown TradingConfig fields"):
+                load_config_experiments(path, self.cfg)
+
+            path.write_text(
+                '{"experiments":[{"name":"bad","overrides":{"max_open_positions":2.5}}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "invalid value for max_open_positions"):
+                load_config_experiments(path, self.cfg)
+
+    def test_walk_forward_windows_are_contiguous_and_cover_holdout(self):
+        windows = build_walk_forward_windows("2024-01-15", "2025-03-10", 6)
+
+        self.assertEqual(
+            windows,
+            [
+                ("2024-01-15", "2024-07-14"),
+                ("2024-07-15", "2025-01-14"),
+                ("2025-01-15", "2025-03-10"),
+            ],
+        )
+
+    def test_walk_forward_windows_reject_invalid_arguments(self):
+        with self.assertRaisesRegex(ValueError, "at least one month"):
+            build_walk_forward_windows("2024-01-01", "2025-01-01", 0)
+        with self.assertRaisesRegex(ValueError, "cannot be later"):
+            build_walk_forward_windows("2025-01-01", "2024-01-01", 6)
+
+    def test_monte_carlo_bootstrap_is_seeded_and_reports_trade_risk(self):
+        trades = [SimpleNamespace(realized_pnl=-30.0)]
+
+        first = monte_carlo_trade_bootstrap(
+            trades, 100.0, simulations=25, drawdown_threshold=-0.25, seed=9,
+        )
+        second = monte_carlo_trade_bootstrap(
+            trades, 100.0, simulations=25, drawdown_threshold=-0.25, seed=9,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first.trades_per_path, 1)
+        self.assertEqual(first.median_ending_equity, 70.0)
+        self.assertAlmostEqual(first.worst_max_drawdown, -0.3)
+        self.assertEqual(first.ninety_fifth_percentile_losing_streak, 1.0)
+        self.assertEqual(first.probability_of_loss, 1.0)
+        self.assertEqual(first.probability_of_drawdown_threshold, 1.0)
+
+    def test_monte_carlo_bootstrap_handles_no_trades_and_validates_inputs(self):
+        empty = monte_carlo_trade_bootstrap([], 100.0, simulations=5)
+        self.assertEqual(empty.median_ending_equity, 100.0)
+        self.assertEqual(empty.probability_of_loss, 0.0)
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            monte_carlo_trade_bootstrap([], 100.0, simulations=0)
+        with self.assertRaisesRegex(ValueError, "drawdown threshold"):
+            monte_carlo_trade_bootstrap([], 100.0, drawdown_threshold=0.1)
+        with self.assertRaisesRegex(ValueError, "seed"):
+            monte_carlo_trade_bootstrap([], 100.0, seed=-1)
 
     def test_real_strategy_candidate_is_unchanged_by_bars_after_signal_date(self):
         dates = pd.date_range("2025-01-02", periods=231)
@@ -466,6 +787,8 @@ class BacktestTests(unittest.TestCase):
         self.assertIn('"target_percent": 1', report)
         self.assertIn("test-run-id", report)
         self.assertIn("test-backtests.sqlite3", report)
+        self.assertIn("Avg open risk", report)
+        self.assertIn(f"{result.average_open_risk_fraction:.2%}", report)
         self.assertIn("## Annualized and Risk-Adjusted Metrics", report)
         self.assertIn("## Trade Distribution", report)
         self.assertIn("## Market Regime Performance", report)
@@ -474,6 +797,9 @@ class BacktestTests(unittest.TestCase):
         self.assertIn("## Relative Strength", report)
         self.assertIn("Sector ETF mapping:", report)
         self.assertIn("Avg gross exposure", report)
+        self.assertIn("## Monte Carlo Trade-Sequence Bootstrap", report)
+        self.assertIn("Probability of threshold drawdown", report)
+        self.assertIn("does not re-simulate overlapping positions", report)
 
     def test_sensitivity_runs_trades_and_equity_persist_to_sqlite(self):
         bars = pd.DataFrame(
@@ -500,13 +826,20 @@ class BacktestTests(unittest.TestCase):
                 commission_per_share=0.005,
                 target_fill_mode="trade_through",
                 target_trade_through_bps=5,
+                universe_source="members.csv",
+                universe_sha256="a" * 64,
+                universe_membership_json='{"TEST":[{"start_date":"2025-01-02","end_date":null}]}',
+                universe_record_count=1,
                 path=database_path,
             )
 
             with closing(sqlite3.connect(database_path)) as database:
                 runs = database.execute(
                     "SELECT run_id, spread_bps, configuration_hash, average_gross_exposure, turnover, market_regime_json "
-                    ", sector_mapping_json, sector_exposure_json, average_pairwise_correlation "
+                    ", sector_mapping_json, sector_exposure_json, average_pairwise_correlation, "
+                    "correlation_blocked_entries, "
+                    "universe_source, universe_sha256, universe_membership_json, universe_record_count, "
+                    "average_open_risk_fraction, peak_open_risk_fraction "
                     "FROM backtest_runs ORDER BY spread_bps"
                 ).fetchall()
                 trade_count = database.execute("SELECT COUNT(*) FROM backtest_trades").fetchone()[0]
@@ -514,6 +847,7 @@ class BacktestTests(unittest.TestCase):
                 trade_sectors = database.execute("SELECT DISTINCT sector FROM backtest_trades").fetchall()
                 equity_count = database.execute("SELECT COUNT(*) FROM backtest_equity").fetchone()[0]
                 foreign_key_errors = database.execute("PRAGMA foreign_key_check").fetchall()
+                schema_version = database.execute("PRAGMA user_version").fetchone()[0]
 
         self.assertEqual(len(run_ids), 2)
         self.assertEqual([row[0] for row in runs], run_ids)
@@ -524,11 +858,19 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(json.loads(runs[0][6]), {"TEST": "Unclassified"})
         self.assertIn("Unclassified", json.loads(runs[0][7]))
         self.assertIsNone(runs[0][8])
+        self.assertEqual(runs[0][9], 0)
+        self.assertEqual(runs[0][10], "members.csv")
+        self.assertEqual(runs[0][11], "a" * 64)
+        self.assertEqual(json.loads(runs[0][12])["TEST"][0]["end_date"], None)
+        self.assertEqual(runs[0][13], 1)
+        self.assertEqual(runs[0][14], result.average_open_risk_fraction)
+        self.assertEqual(runs[0][15], result.peak_open_risk_fraction)
         self.assertEqual(trade_count, len(result.trades) * 2)
         self.assertEqual(market_regimes, [("UNKNOWN",)])
         self.assertEqual(trade_sectors, [("Unclassified",)])
         self.assertEqual(equity_count, len(result.equity_curve) * 2)
         self.assertEqual(foreign_key_errors, [])
+        self.assertEqual(schema_version, 7)
 
     def test_missing_symbol_session_uses_last_close_and_final_equity_is_liquidated(self):
         test_bars = pd.DataFrame(

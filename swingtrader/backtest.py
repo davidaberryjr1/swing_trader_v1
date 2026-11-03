@@ -1,13 +1,15 @@
 from dataclasses import asdict, dataclass, replace
-from datetime import date, datetime, time, timezone
+from datetime import date
 import hashlib
 import json
-from typing import Callable, Protocol
+import math
+from typing import Callable
 
 import numpy as np
 import pandas as pd
 
 from .config import TradingConfig
+from .correlations import highest_absolute_correlation, validate_correlation_config
 from .scanner import (
     STRATEGY_ID,
     STRATEGY_VERSION,
@@ -15,63 +17,7 @@ from .scanner import (
     evaluate_candidate,
     refresh_candidate_price,
 )
-
-SECTOR_BY_SYMBOL = {
-    "F": "Consumer Discretionary",
-    "CCL": "Consumer Discretionary",
-    "RIVN": "Consumer Discretionary",
-    "BAC": "Financials",
-    "SOFI": "Financials",
-    "NU": "Financials",
-    "SNAP": "Communication Services",
-    "PLTR": "Information Technology",
-    "INTC": "Information Technology",
-    "PFE": "Health Care",
-}
-SECTOR_ETF_BY_SECTOR = {
-    "Consumer Discretionary": "XLY",
-    "Financials": "XLF",
-    "Communication Services": "XLC",
-    "Information Technology": "XLK",
-    "Health Care": "XLV",
-}
-
-
-class MarketDataProvider(Protocol):
-    def get_bars(self, symbols: list[str], start: str, end: str) -> dict[str, pd.DataFrame]: ...
-
-
-class AlpacaMarketDataProvider:
-    def __init__(self, api_key: str, secret_key: str):
-        from alpaca.data.historical import StockHistoricalDataClient
-
-        self._client = StockHistoricalDataClient(api_key, secret_key)
-
-    def get_bars(self, symbols: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
-        from alpaca.data.enums import Adjustment, DataFeed
-        from alpaca.data.requests import StockBarsRequest
-        from alpaca.data.timeframe import TimeFrame
-
-        start_dt = datetime.combine(date.fromisoformat(start), time.min, tzinfo=timezone.utc)
-        end_dt = datetime.combine(date.fromisoformat(end), time.max, tzinfo=timezone.utc)
-        response = self._client.get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=symbols,
-            start=start_dt,
-            end=end_dt,
-            timeframe=TimeFrame.Day,
-            adjustment=Adjustment.SPLIT,
-            feed=DataFeed.IEX,
-        ))
-        frame = response.df
-        histories = {}
-        for symbol in symbols:
-            try:
-                history = frame.xs(symbol, level="symbol").copy()
-            except KeyError:
-                continue
-            history.columns = [str(column).title() for column in history.columns]
-            histories[symbol] = history[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        return histories
+from .sectors import SECTOR_BY_SYMBOL, SECTOR_ETF_BY_SECTOR, sector_for_symbol
 
 
 @dataclass
@@ -133,14 +79,33 @@ class BacktestResult:
     average_holding_sessions: float
     average_gross_exposure: float
     turnover: float
+    average_open_risk_fraction: float
+    peak_open_risk_fraction: float
     market_regime_metrics: dict[str, dict[str, float | int]]
     sector_mapping: dict[str, str]
     sector_etf_mapping: dict[str, str]
     sector_exposure_metrics: dict[str, dict[str, float]]
     average_pairwise_correlation: float | None
     max_pairwise_correlation: float | None
+    correlation_blocked_entries: int
     average_relative_strength_vs_market: float | None
     average_relative_strength_vs_sector: float | None
+
+
+@dataclass
+class MonteCarloSummary:
+    simulations: int
+    trades_per_path: int
+    mean_ending_equity: float
+    median_ending_equity: float
+    fifth_percentile_ending_equity: float
+    ninety_fifth_percentile_ending_equity: float
+    median_max_drawdown: float
+    fifth_percentile_max_drawdown: float
+    worst_max_drawdown: float
+    ninety_fifth_percentile_losing_streak: float
+    probability_of_loss: float
+    probability_of_drawdown_threshold: float
 
 
 @dataclass
@@ -165,6 +130,7 @@ class _Position:
 @dataclass
 class _Signal:
     candidate: TradeCandidate
+    signal_date: pd.Timestamp
     market_regime: str
     sector: str
     sector_etf: str | None
@@ -182,6 +148,100 @@ def _historical_strategy(symbol: str, bars: pd.DataFrame, cfg: TradingConfig):
 def configuration_hash(cfg: TradingConfig) -> str:
     payload = json.dumps(asdict(cfg), sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_walk_forward_windows(
+    first_test_start: str,
+    end: str,
+    window_months: int,
+) -> list[tuple[str, str]]:
+    if window_months < 1:
+        raise ValueError("Walk-forward window length must be at least one month")
+    first = pd.Timestamp(date.fromisoformat(first_test_start))
+    last = pd.Timestamp(date.fromisoformat(end))
+    if first > last:
+        raise ValueError("Walk-forward start date cannot be later than end date")
+
+    windows = []
+    window_start = first
+    while window_start <= last:
+        next_start = window_start + pd.DateOffset(months=window_months)
+        window_end = min(next_start - pd.Timedelta(days=1), last)
+        windows.append((window_start.date().isoformat(), window_end.date().isoformat()))
+        window_start = window_end + pd.Timedelta(days=1)
+    return windows
+
+
+def monte_carlo_trade_bootstrap(
+    trades: list[BacktestTrade],
+    starting_equity: float,
+    *,
+    simulations: int = 1000,
+    drawdown_threshold: float = -0.20,
+    seed: int = 42,
+) -> MonteCarloSummary:
+    if not np.isfinite(starting_equity) or starting_equity <= 0:
+        raise ValueError("Monte Carlo starting equity must be a positive finite value")
+    if (
+        isinstance(simulations, bool)
+        or not isinstance(simulations, (int, np.integer))
+        or simulations < 1
+    ):
+        raise ValueError("Monte Carlo simulations must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or seed < 0:
+        raise ValueError("Monte Carlo seed must be a non-negative integer")
+    if not np.isfinite(drawdown_threshold) or not -1 <= drawdown_threshold <= 0:
+        raise ValueError("Monte Carlo drawdown threshold must be between -1 and 0")
+
+    pnl = np.asarray([trade.realized_pnl for trade in trades], dtype=float)
+    if not np.isfinite(pnl).all():
+        raise ValueError("Monte Carlo trade P&L must contain only finite values")
+    if not len(pnl):
+        return MonteCarloSummary(
+            simulations=simulations,
+            trades_per_path=0,
+            mean_ending_equity=starting_equity,
+            median_ending_equity=starting_equity,
+            fifth_percentile_ending_equity=starting_equity,
+            ninety_fifth_percentile_ending_equity=starting_equity,
+            median_max_drawdown=0.0,
+            fifth_percentile_max_drawdown=0.0,
+            worst_max_drawdown=0.0,
+            ninety_fifth_percentile_losing_streak=0.0,
+            probability_of_loss=0.0,
+            probability_of_drawdown_threshold=0.0,
+        )
+
+    sampled_pnl = np.random.default_rng(seed).choice(
+        pnl, size=(simulations, len(pnl)), replace=True,
+    )
+    equity_paths = starting_equity + sampled_pnl.cumsum(axis=1)
+    running_peaks = np.maximum.accumulate(
+        np.column_stack((np.full(simulations, starting_equity), equity_paths)),
+        axis=1,
+    )[:, 1:]
+    maximum_drawdowns = np.min(equity_paths / running_peaks - 1, axis=1)
+    current_streak = np.zeros(simulations, dtype=int)
+    longest_streak = np.zeros(simulations, dtype=int)
+    for trade_pnl in sampled_pnl.T:
+        current_streak = np.where(trade_pnl < 0, current_streak + 1, 0)
+        longest_streak = np.maximum(longest_streak, current_streak)
+
+    ending_equity = equity_paths[:, -1]
+    return MonteCarloSummary(
+        simulations=simulations,
+        trades_per_path=len(pnl),
+        mean_ending_equity=float(np.mean(ending_equity)),
+        median_ending_equity=float(np.median(ending_equity)),
+        fifth_percentile_ending_equity=float(np.percentile(ending_equity, 5)),
+        ninety_fifth_percentile_ending_equity=float(np.percentile(ending_equity, 95)),
+        median_max_drawdown=float(np.median(maximum_drawdowns)),
+        fifth_percentile_max_drawdown=float(np.percentile(maximum_drawdowns, 5)),
+        worst_max_drawdown=float(np.min(maximum_drawdowns)),
+        ninety_fifth_percentile_losing_streak=float(np.percentile(longest_streak, 95)),
+        probability_of_loss=float(np.mean(ending_equity < starting_equity)),
+        probability_of_drawdown_threshold=float(np.mean(maximum_drawdowns <= drawdown_threshold)),
+    )
 
 
 def _normalize_bars(bars: pd.DataFrame) -> pd.DataFrame:
@@ -247,11 +307,25 @@ def run_backtest(
     benchmark: pd.DataFrame | None = None,
     sector_map: dict[str, str] | None = None,
     sector_benchmarks: dict[str, pd.DataFrame] | None = None,
+    simulation_start: str | None = None,
+    simulation_end: str | None = None,
+    universe_membership: dict[str, tuple[tuple[date, date | None], ...]] | None = None,
 ) -> BacktestResult:
     """Run close-generated signals at the following session's open using daily bars."""
     costs = (slippage_bps, spread_bps, commission_per_share, target_trade_through_bps)
     if any(not np.isfinite(cost) or cost < 0 for cost in costs):
         raise ValueError("Execution costs cannot be negative")
+    if (
+        not np.isfinite(cfg.max_sector_exposure_fraction)
+        or not 0 < cfg.max_sector_exposure_fraction <= 1
+    ):
+        raise ValueError("Maximum sector exposure fraction must be greater than 0 and at most 1")
+    if (
+        not np.isfinite(cfg.max_combined_risk_fraction)
+        or not 0 < cfg.max_combined_risk_fraction <= 1
+    ):
+        raise ValueError("Maximum combined risk fraction must be greater than 0 and at most 1")
+    validate_correlation_config(cfg)
     if target_fill_mode not in {"touch", "trade_through"}:
         raise ValueError("Target fill mode must be 'touch' or 'trade_through'")
 
@@ -259,12 +333,28 @@ def run_backtest(
     sessions = sorted(set().union(*(set(bars.index) for bars in data.values()))) if data else []
     if not sessions:
         raise ValueError("No historical bars available for the requested backtest")
+    start_date = pd.Timestamp(date.fromisoformat(simulation_start)) if simulation_start else sessions[0]
+    end_date = pd.Timestamp(date.fromisoformat(simulation_end)) if simulation_end else sessions[-1]
+    if start_date > end_date:
+        raise ValueError("Simulation start date cannot be later than end date")
+    active_sessions = [day for day in sessions if start_date <= day <= end_date]
+    if not active_sessions:
+        raise ValueError("No historical bars available inside the requested simulation period")
+    final_day = active_sessions[-1]
+
+    def is_universe_member(symbol: str, day: pd.Timestamp) -> bool:
+        if universe_membership is None:
+            return True
+        return any(
+            first <= day.date() and (last is None or day.date() <= last)
+            for first, last in universe_membership.get(symbol, ())
+        )
 
     market_cost = (slippage_bps + spread_bps / 2) / 10_000
     config_fingerprint = configuration_hash(cfg)
     market_regimes = _market_regimes(benchmark)
     sectors = {
-        symbol: SECTOR_BY_SYMBOL.get(symbol, "Unclassified")
+        symbol: sector_for_symbol(symbol)
         for symbol in data
     }
     if sector_map:
@@ -292,9 +382,11 @@ def run_backtest(
     equity_values: list[float] = []
     equity_dates: list[pd.Timestamp] = []
     exposure_fractions: list[float] = []
+    open_risk_fractions: list[float] = []
     sector_exposure_fractions = {sector: [] for sector in tracked_sectors}
     daily_pairwise_correlations: list[float] = []
     maximum_pairwise_correlations: list[float] = []
+    correlation_blocked_entries = 0
     last_closes: dict[str, tuple[pd.Timestamp, float]] = {}
 
     def close_position(symbol: str, position: _Position, day: pd.Timestamp, price: float, reason: str):
@@ -339,6 +431,10 @@ def run_backtest(
         del positions[symbol]
 
     for session_index, day in enumerate(sessions):
+        if day < start_date:
+            continue
+        if day > end_date:
+            break
         today = {symbol: bars.loc[day] for symbol, bars in data.items() if day in bars.index}
 
         # Stops and targets crossed by the open execute before new entries compete for capital.
@@ -362,7 +458,11 @@ def run_backtest(
         ):
             candidate = signal.candidate
             bar = today.get(candidate.symbol)
-            if bar is None or candidate.symbol in positions:
+            if (
+                bar is None
+                or candidate.symbol in positions
+                or not is_universe_member(candidate.symbol, day)
+            ):
                 continue
             if len(positions) >= cfg.max_open_positions:
                 break
@@ -372,8 +472,57 @@ def run_backtest(
             if sized is None or sized.shares * (fill_price + commission_per_share) > cash:
                 continue
             open_risk = sum(position.initial_risk for position in positions.values())
-            if open_risk + sized.risk_dollars > cash * cfg.max_combined_risk_fraction:
+            portfolio_equity = cash + sum(
+                position.shares * (
+                    float(today[held_symbol]["Open"])
+                    if held_symbol in today else last_closes[held_symbol][1]
+                )
+                for held_symbol, position in positions.items()
+            )
+            risk_balance = min(max(portfolio_equity, 0.0), cfg.account_size)
+            remaining_risk = max(
+                0.0,
+                risk_balance * cfg.max_combined_risk_fraction - open_risk,
+            )
+            risk_per_share = fill_price - sized.stop
+            affordable_risk_shares = math.floor(remaining_risk / risk_per_share)
+            if affordable_risk_shares < sized.shares:
+                if affordable_risk_shares < 1:
+                    continue
+                sized = replace(
+                    sized,
+                    shares=affordable_risk_shares,
+                    risk_dollars=affordable_risk_shares * risk_per_share,
+                )
+            if sized.shares * (fill_price + commission_per_share) > cash:
                 continue
+            sector_exposure = sum(
+                position.shares * (
+                    float(today[held_symbol]["Open"])
+                    if held_symbol in today else last_closes[held_symbol][1]
+                )
+                for held_symbol, position in positions.items()
+                if position.sector == sectors[sized.symbol]
+            )
+            sector_limit = cfg.account_size * cfg.max_sector_exposure_fraction
+            if sector_exposure + sized.shares * fill_price > sector_limit:
+                continue
+            if positions:
+                correlation = highest_absolute_correlation(
+                    daily_returns[sized.symbol].loc[:signal.signal_date],
+                    {
+                        held_symbol: daily_returns[held_symbol].loc[:signal.signal_date]
+                        for held_symbol in positions
+                    },
+                    window=cfg.correlation_lookback_sessions,
+                    minimum_observations=cfg.correlation_min_observations,
+                )
+                if (
+                    correlation is not None
+                    and correlation[1] >= cfg.correlation_absolute_threshold
+                ):
+                    correlation_blocked_entries += 1
+                    continue
             cash -= sized.shares * fill_price + commission_per_share * sized.shares
             positions[sized.symbol] = _Position(
                 candidate=sized,
@@ -408,9 +557,9 @@ def run_backtest(
                 if float(bar["High"]) >= target_trigger:
                     close_position(symbol, position, day, position.target_price, "target")
 
-        if session_index < len(sessions) - 1:
+        if day < final_day:
             for symbol, bars in data.items():
-                if day not in bars.index:
+                if day not in bars.index or not is_universe_member(symbol, day):
                     continue
                 prefix = bars.loc[:day]
                 cache_key = (config_fingerprint, symbol, day)
@@ -425,6 +574,7 @@ def run_backtest(
                     sector_return = _value_at(sector_returns_20d.get(sector_etf), day) if sector_etf else None
                     pending.append(_Signal(
                         candidate=candidate,
+                        signal_date=day,
                         market_regime=market_regimes.get(day, "UNKNOWN"),
                         sector=sector,
                         sector_etf=sector_etf,
@@ -445,6 +595,8 @@ def run_backtest(
         )
         marked_equity = cash + gross_exposure
         exposure_fractions.append(gross_exposure / marked_equity if marked_equity > 0 else 0.0)
+        open_risk = sum(position.initial_risk for position in positions.values())
+        open_risk_fractions.append(open_risk / marked_equity if marked_equity > 0 else 0.0)
         sector_market_values = {sector: 0.0 for sector in tracked_sectors}
         for symbol, position in positions.items():
             if symbol in last_closes:
@@ -470,7 +622,6 @@ def run_backtest(
         equity_values.append(marked_equity)
         equity_dates.append(day)
 
-    final_day = sessions[-1]
     for symbol, position in list(positions.items()):
         last_day, last_close = last_closes[symbol]
         close_position(symbol, position, last_day, last_close, "end_of_test")
@@ -515,7 +666,11 @@ def run_backtest(
     benchmark_return = None
     if benchmark is not None and not benchmark.empty:
         benchmark_bars = _normalize_bars(benchmark)
-        benchmark_return = float(benchmark_bars["Close"].iloc[-1] / benchmark_bars["Open"].iloc[0] - 1)
+        benchmark_period = benchmark_bars.loc[active_sessions[0]:final_day]
+        if not benchmark_period.empty:
+            benchmark_return = float(
+                benchmark_period["Close"].iloc[-1] / benchmark_period["Open"].iloc[0] - 1
+            )
     benchmark_alpha = cash / cfg.account_size - 1 - benchmark_return if benchmark_return is not None else None
     average_equity = float(equity_curve.mean()) if not equity_curve.empty else 0.0
     traded_notional = sum((trade.entry_price + trade.exit_price) * trade.shares for trade in trades)
@@ -565,12 +720,15 @@ def run_backtest(
         average_holding_sessions=float(np.mean([trade.holding_sessions for trade in trades])) if trades else 0.0,
         average_gross_exposure=float(np.mean(exposure_fractions)) if exposure_fractions else 0.0,
         turnover=traded_notional / average_equity if average_equity > 0 else 0.0,
+        average_open_risk_fraction=float(np.mean(open_risk_fractions)) if open_risk_fractions else 0.0,
+        peak_open_risk_fraction=float(np.max(open_risk_fractions)) if open_risk_fractions else 0.0,
         market_regime_metrics=market_regime_metrics,
         sector_mapping=sectors,
         sector_etf_mapping=sector_etf_mapping,
         sector_exposure_metrics=sector_metrics,
         average_pairwise_correlation=(float(np.mean(daily_pairwise_correlations)) if daily_pairwise_correlations else None),
         max_pairwise_correlation=(float(np.max(maximum_pairwise_correlations)) if maximum_pairwise_correlations else None),
+        correlation_blocked_entries=correlation_blocked_entries,
         average_relative_strength_vs_market=(float(np.mean(relative_strength_market)) if relative_strength_market else None),
         average_relative_strength_vs_sector=(float(np.mean(relative_strength_sector)) if relative_strength_sector else None),
     )
@@ -588,6 +746,13 @@ def format_spread_sensitivity_report(
     commission_per_share: float,
     target_fill_mode: str,
     target_trade_through_bps: float,
+    monte_carlo_simulations: int = 1000,
+    monte_carlo_drawdown_threshold: float = -0.20,
+    monte_carlo_seed: int = 42,
+    universe_source: str | None = None,
+    universe_sha256: str | None = None,
+    universe_record_count: int = 0,
+    experiment_name: str | None = None,
 ) -> str:
     if not results:
         raise ValueError("At least one spread scenario is required")
@@ -608,6 +773,12 @@ def format_spread_sensitivity_report(
         f"Symbols: {', '.join(symbols)}",
         f"Strategy: {base_result.strategy_id} v{base_result.strategy_version}",
         f"Trading configuration SHA-256: {base_result.configuration_hash}",
+        f"Universe: {'date-effective file' if universe_sha256 else 'explicit fixed symbol list'}",
+        f"Universe source: {universe_source or 'N/A'}",
+        f"Universe SHA-256: {universe_sha256 or 'N/A'}",
+        f"Universe membership records: {universe_record_count}",
+        f"Experiment: {experiment_name or 'N/A'}",
+        "When provided, exact date-effective membership intervals are persisted with each run in the SQLite ledger.",
         f"SQLite ledger: `{database_path}`",
         "Sector mapping (manual, descriptive):",
         "```json",
@@ -625,11 +796,12 @@ def format_spread_sensitivity_report(
         f"Slippage: {slippage_bps:g} bps per market-side fill",
         f"Commission: ${commission_per_share:g} per share per side",
         f"Target limit fills: {target_fill_mode}; base trade-through: {target_trade_through_bps:g} bps, plus half-spread",
+        "Open risk is planned stop distance times shares divided by marked equity; it does not account for gap losses.",
         "",
         "## Scenario Comparison",
         "",
-        "| Run ID | Full spread (bps) | Ending equity | Return | Max drawdown | Trades | Win rate | Avg R | Profit factor | Avg gross exposure | Turnover | Avg corr | Max corr | SPY price return |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run ID | Full spread (bps) | Ending equity | Return | Max drawdown | Trades | Corr blocks | Win rate | Avg R | Profit factor | Avg gross exposure | Avg open risk | Peak open risk | Turnover | Avg corr | Max corr | SPY price return |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for run_id, (spread_bps, result) in zip(run_ids, results):
         total_return = result.ending_equity / result.starting_equity - 1
@@ -639,8 +811,10 @@ def format_spread_sensitivity_report(
         maximum_correlation = "N/A" if result.max_pairwise_correlation is None else f"{result.max_pairwise_correlation:.2f}"
         report.append(
             f"| {run_id} | {spread_bps:g} | ${result.ending_equity:,.2f} | {total_return:.2%} | "
-            f"{result.max_drawdown:.2%} | {len(result.trades)} | {result.win_rate:.2%} | "
+            f"{result.max_drawdown:.2%} | {len(result.trades)} | {result.correlation_blocked_entries} | "
+            f"{result.win_rate:.2%} | "
             f"{result.average_r:.2f} | {profit_factor} | {result.average_gross_exposure:.2%} | "
+            f"{result.average_open_risk_fraction:.2%} | {result.peak_open_risk_fraction:.2%} | "
             f"{result.turnover:.2f}x | {average_correlation} | {maximum_correlation} | {benchmark} |"
         )
 
@@ -665,7 +839,7 @@ def format_spread_sensitivity_report(
         "",
         "## Open-Position Correlation",
         "",
-        "Correlation uses up to 60 daily returns through each session close, requires 20 common observations, and is sampled only when multiple positions are open.",
+        "Descriptive pairwise portfolio correlation uses up to 60 daily returns through each session close, requires 20 common observations, and is sampled only when multiple positions are open. Entry blocking uses the separately configured threshold and minimum observation count.",
         "",
         "| Full spread (bps) | Average pairwise correlation | Maximum pairwise correlation |",
         "|---:|---:|---:|",
@@ -750,6 +924,34 @@ def format_spread_sensitivity_report(
             f"| {spread_bps:g} | {money(result.average_win)} | {money(result.average_loss)} | "
             f"{money(result.median_win)} | {money(result.median_loss)} | ${result.expectancy_dollars:.2f} | "
             f"{result.average_r:.2f} | {result.max_consecutive_losses} | {result.average_holding_sessions:.1f} |"
+        )
+
+    report.extend([
+        "",
+        "## Monte Carlo Trade-Sequence Bootstrap",
+        "",
+        f"{monte_carlo_simulations:,} paths; seed {monte_carlo_seed}; drawdown threshold {monte_carlo_drawdown_threshold:.1%}. "
+        "Each path resamples the scenario's closed-trade dollar P&L independently with replacement, keeping the observed trade count.",
+        "This exploratory trade-sequence analysis does not re-simulate overlapping positions, dynamic sizing, or compounding, and does not preserve trade dependence. "
+        "It is not a substitute for portfolio-path simulation.",
+        "",
+        "| Full spread (bps) | Median ending equity | 5th-95th percentile ending equity | Median max drawdown | 5th percentile max drawdown | Worst simulated drawdown | 95th percentile losing streak | Probability of loss | Probability of threshold drawdown |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for scenario_index, (spread_bps, result) in enumerate(results):
+        summary = monte_carlo_trade_bootstrap(
+            result.trades,
+            result.starting_equity,
+            simulations=monte_carlo_simulations,
+            drawdown_threshold=monte_carlo_drawdown_threshold,
+            seed=monte_carlo_seed + scenario_index,
+        )
+        report.append(
+            f"| {spread_bps:g} | ${summary.median_ending_equity:,.2f} | "
+            f"${summary.fifth_percentile_ending_equity:,.2f} - ${summary.ninety_fifth_percentile_ending_equity:,.2f} | "
+            f"{summary.median_max_drawdown:.2%} | {summary.fifth_percentile_max_drawdown:.2%} | "
+            f"{summary.worst_max_drawdown:.2%} | {summary.ninety_fifth_percentile_losing_streak:.0f} | "
+            f"{summary.probability_of_loss:.2%} | {summary.probability_of_drawdown_threshold:.2%} |"
         )
 
     ledger_spread, ledger_result = min(results, key=lambda item: abs(item[0] - 5.0))
