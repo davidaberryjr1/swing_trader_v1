@@ -21,6 +21,7 @@ from .sectors import sector_for_symbol
 
 CREDENTIALS_PATH = Path(__file__).resolve().parent.parent / "config.py"
 ENTRY_TIMEOUT = timedelta(minutes=10)
+QUOTE_CLOCK_SKEW_TOLERANCE = timedelta(seconds=10)
 
 
 @dataclass(frozen=True)
@@ -402,8 +403,11 @@ def submit_paper_candidate(candidate: TradeCandidate, cfg: TradingConfig, *, exe
     if quote is None or quote.timestamp is None or quote.timestamp.tzinfo is None:
         raise ValueError("No timestamped Alpaca quote available")
     age = datetime.now(timezone.utc) - quote.timestamp.astimezone(timezone.utc)
-    if age < timedelta(0) or age > timedelta(seconds=cfg.max_quote_age_seconds):
-        raise ValueError("Alpaca quote is stale; no order placed")
+    # Allow a few seconds of local clock skew; a quote far in the future is still rejected.
+    if age < -QUOTE_CLOCK_SKEW_TOLERANCE or age > timedelta(seconds=cfg.max_quote_age_seconds):
+        raise ValueError(
+            f"Alpaca quote is stale; no order placed (quote age {age.total_seconds():.0f}s)"
+        )
     plan = plan_paper_order(candidate, float(quote.bid_price), float(quote.ask_price), cfg)
     enforce_sector_exposure_limit(
         plan.symbol,
